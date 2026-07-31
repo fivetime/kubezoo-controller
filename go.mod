@@ -37,7 +37,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/emicklei/go-restful/v3 v3.13.0 // indirect
 	github.com/evanphx/json-patch/v5 v5.9.11 // indirect
-	github.com/fivetime/kubezoo-contract v0.5.0
+	github.com/fivetime/kubezoo-contract v0.6.0
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
 	github.com/go-openapi/jsonpointer v0.21.0 // indirect
@@ -122,3 +122,10 @@ replace (
 	k8s.io/system-validators => k8s.io/system-validators v1.7.0
 	k8s.io/utils => k8s.io/utils v0.0.0-20260210185600-b8788abfbbc2
 )
+
+// A replace with no require. Nothing here imports kube-aggregator, but
+// k8s.io/kubernetes requires it at the placeholder v0.0.0 and replaces it with a
+// relative path, which does not carry downstream -- so this module has to
+// resolve the version regardless. Without it `go list -m all` fails while
+// `go build` stays green. See the same note in kubezoo-contract.
+replace k8s.io/kube-aggregator => k8s.io/kube-aggregator v0.36.3
