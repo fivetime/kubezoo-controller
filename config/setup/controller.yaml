@@ -115,11 +115,13 @@ spec:
             - name: kubezoo-kubeconfig
               mountPath: /etc/kubezoo/kubeconfig
       volumes:
-        # kubezoo-gateway 的 hack/lib/gen_pki.sh 建的,两个部署共用同一份 CA ——
-        # 控制器签出来的租户证书必须是 kubezoo 认的那个 CA 签的。
+        # ⭐ 只有控制器拿签名私钥。kubezoo-gateway 只验证租户证书(用 ca.pem),
+        # 不签发,所以它的 kubezoo-pki Secret 里**没有** ca-key.pem ——
+        # 租户信任链的根只待在一个 Pod 里,而不是两个。
+        # 两份都由 kubezoo-gateway 的 hack/lib/gen_pki.sh 生成,必须同一个 CA。
         - name: kubezoo-pki
           secret:
-            secretName: kubezoo-pki
+            secretName: kubezoo-ca
         - name: kubezoo-kubeconfig
           secret:
             secretName: kubezoo-controller-kubeconfig
