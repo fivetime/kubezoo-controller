@@ -3,8 +3,16 @@
 把上游集群对账成 Tenant 声明的样子:建租户的 namespace、发 RoleBinding、
 把 ClusterRoleBinding 投影到各 namespace、派生集群级授权、执行停机。
 
-依赖 [kubezoo-contract](https://github.com/fivetime/kubezoo-contract) 里的翻译规则 ——
-它算出来的名字必须和 `kubezoo-proxy` 改写请求时算出来的**完全一致**。
+三个仓库之一,**部署时三个都要**:
+
+| | |
+|---|---|
+| [kubezoo-proxy](https://github.com/fivetime/kubezoo-proxy) | 租户直接访问的 API 服务端,Tenant 对象存在那里 |
+| [kubezoo-contract](https://github.com/fivetime/kubezoo-contract) | 翻译规则、API 类型、准入策略 |
+| **kubezoo-controller**(本仓库) | 把上游对账成 Tenant 声明的样子 |
+
+它算出来的名字必须和 `kubezoo-proxy` 改写请求时算出来的**完全一致**,所以两边共用
+contract 里那一份规则 —— 漂移了就是跨租户 bug,而且是静默的。
 
 ## 为什么是独立进程
 
@@ -41,12 +49,6 @@ kubezoo-controller \
 ⚠️ 做之前要先解决:informer 按分片过滤(需要 shard 标签,否则每个副本还是得 watch 全部)、
 重平衡期间的双主、以及验收必须是"实测负载真的分开了"。
 
-## 测试
-
-```
-make test            # 单测 + 需要真 apiserver 的控制器测试
-```
-
 ## 部署
 
 `config/setup/controller.yaml`(ServiceAccount + ClusterRole + 绑定 + Deployment)。
@@ -71,3 +73,25 @@ is attempting to grant RBAC permissions not currently held
 ```
 
 —— 这条报错**完全不提 bind**,看不出是授权对象放错了地方。
+
+## 开发
+
+```
+make build           # 二进制到 _output/local/bin/
+make test            # 单测 + 需要真 apiserver 的控制器测试
+```
+
+⭐ 控制器的测试**对着真 apiserver 跑**(envtest),不是 fake client。
+它检验的东西就是"往一个真集群里写进去了什么",而 fake 只能确认代码调用了它调用的函数。
+
+单独调试控制器(需要一个已经跑起来的 kubezoo 和上游集群):
+
+```
+hack/lab/up-controller.sh <工作目录> <kubezoo-kubeconfig> <upstream-kubeconfig> <CA目录>
+```
+
+⚠️ 这个脚本**也是 kubezoo-proxy 的 lab 调的那一份** —— 那边不该再抄一份怎么起控制器,
+抄了就会和这里支持的参数漂移。
+
+完整的隔离验证(118 条断言)在 kubezoo-proxy 的 `hack/lab/verify.sh`,
+**需要三个仓库都在** —— 每一条断言都从建一个租户开始,那需要三者同时在跑。
