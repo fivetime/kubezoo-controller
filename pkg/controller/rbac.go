@@ -39,9 +39,9 @@ import (
 	"k8s.io/kubernetes/pkg/apis/rbac"
 	rbacv1helpers "k8s.io/kubernetes/pkg/apis/rbac/v1"
 
+	tenantv1alpha1 "github.com/fivetime/kubezoo-contract/pkg/apis/tenant/v1alpha1"
 	"github.com/fivetime/kubezoo-contract/pkg/common"
 	"github.com/fivetime/kubezoo-contract/pkg/util"
-	tenantv1alpha1 "github.com/fivetime/kubezoo-contract/pkg/apis/tenant/v1alpha1"
 )
 
 // Names of the two shared RBAC objects. Unlike the per-tenant ClusterRole these
@@ -685,6 +685,46 @@ func resolvedSubjects(record *rbacv1.RoleBinding) []rbacv1.Subject {
 	return resolved
 }
 
+// withdrawOwnGroupClusterBindings deletes the cluster-scoped objects derived
+// from a tenant's ClusterRoleBindings that are no longer wanted. A nil keep set
+// withdraws all of them, which is what tenant teardown wants.
+//
+// ⚠️ Teardown needs this because it cannot find them any other way: it sweeps
+// cluster-scoped objects by the tenant's name prefix, and these are named
+// kubezoo:crgroups:<tid>:<binding>. Nothing deleted them, so every tenant
+// lifecycle left a pair behind for good.
+func withdrawOwnGroupClusterBindings(rbacClient rbacclient.RbacV1Interface, tenantID string,
+	keep map[string]*rbacv1.ClusterRoleBinding) error {
+
+	existing, err := rbacClient.ClusterRoleBindings().List(context.TODO(), metav1.ListOptions{
+		LabelSelector: labels.SelectorFromSet(labels.Set{common.TenantNamespaceLabelKey: tenantID}).String(),
+	})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("listing tenant %s's derived cluster bindings: %w", tenantID, err)
+	}
+	for i := range existing.Items {
+		name := existing.Items[i].Name
+		if !strings.HasPrefix(name, ownGroupBindingPrefix) {
+			continue
+		}
+		if _, wanted := keep[name]; wanted {
+			continue
+		}
+		if err := rbacClient.ClusterRoleBindings().Delete(context.TODO(), name,
+			metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("withdrawing derived cluster binding %s: %w", name, err)
+		}
+		if err := rbacClient.ClusterRoles().Delete(context.TODO(), name,
+			metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("withdrawing derived cluster role %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
 func syncOwnGroupClusterBindings(rbacClient rbacclient.RbacV1Interface, tenantID string,
 	mode tenantv1alpha1.TenantSuspensionMode) error {
 
@@ -751,28 +791,8 @@ func syncOwnGroupClusterBindings(rbacClient rbacclient.RbacV1Interface, tenantID
 
 	// Withdraw first: a binding whose record is gone still grants, and the
 	// tenant has nothing in its own view that would explain it.
-	existing, err := rbacClient.ClusterRoleBindings().List(context.TODO(), metav1.ListOptions{
-		LabelSelector: labels.SelectorFromSet(labels.Set{common.TenantNamespaceLabelKey: tenantID}).String(),
-	})
-	if err != nil {
-		return fmt.Errorf("listing tenant %s's derived cluster bindings: %w", tenantID, err)
-	}
-	for i := range existing.Items {
-		name := existing.Items[i].Name
-		if !strings.HasPrefix(name, ownGroupBindingPrefix) {
-			continue
-		}
-		if _, keep := wanted[name]; keep {
-			continue
-		}
-		if err := rbacClient.ClusterRoleBindings().Delete(context.TODO(), name,
-			metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("withdrawing derived cluster binding %s: %w", name, err)
-		}
-		if err := rbacClient.ClusterRoles().Delete(context.TODO(), name,
-			metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("withdrawing derived cluster role %s: %w", name, err)
-		}
+	if err := withdrawOwnGroupClusterBindings(rbacClient, tenantID, wanted); err != nil {
+		return err
 	}
 
 	for name, role := range roles {
@@ -803,5 +823,3 @@ func syncOwnGroupClusterBindings(rbacClient rbacclient.RbacV1Interface, tenantID
 	}
 	return nil
 }
-
-

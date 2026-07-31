@@ -49,14 +49,14 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog"
 
-	"github.com/fivetime/kubezoo-contract/pkg/common"
-	"github.com/fivetime/kubezoo-contract/pkg/util"
 	quotav1alpha1 "github.com/fivetime/kubezoo-contract/pkg/apis/quota/v1alpha1"
 	tenantv1alpha1 "github.com/fivetime/kubezoo-contract/pkg/apis/tenant/v1alpha1"
+	"github.com/fivetime/kubezoo-contract/pkg/common"
 	"github.com/fivetime/kubezoo-contract/pkg/dynamic"
 	quotaclient "github.com/fivetime/kubezoo-contract/pkg/generated/clientset/versioned/typed/quota/v1alpha1"
 	tenantclient "github.com/fivetime/kubezoo-contract/pkg/generated/clientset/versioned/typed/tenant/v1alpha1"
 	tenantlister "github.com/fivetime/kubezoo-contract/pkg/generated/listers/tenant/v1alpha1"
+	"github.com/fivetime/kubezoo-contract/pkg/util"
 )
 
 type EventType int
@@ -469,6 +469,18 @@ func (tc *TenantController) deleteResources(tenantId string) error {
 		return err
 	}
 
+	// ⚠️ The sweep above finds objects by the tenant's name prefix, and the
+	// cluster-scoped bindings derived from a tenant's ClusterRoleBindings are not
+	// named that way -- they are kubezoo:crgroups:<tid>:<binding>. Nothing else
+	// deleted them, so every tenant lifecycle left a ClusterRole and a
+	// ClusterRoleBinding behind for good, granting rights over that tenant's own
+	// API groups to a subject in that tenant's own namespaces. Not reachable by
+	// anyone once the tenant is gone, but RBAC is loaded into every apiserver's
+	// authorizer and this accumulated without bound.
+	if err := withdrawOwnGroupClusterBindings(tc.upstreamRbacClient, tenantId, nil); err != nil {
+		return errors.Errorf("fail to withdraw derived cluster bindings for tenant %s: %v", tenantId, err)
+	}
+
 	// Last, and deliberately so. The namespaces are terminating by now, which
 	// admits no new objects, and the tenant's cluster-scoped bindings are gone --
 	// so a finalizer cleared here cannot be put back.
@@ -513,7 +525,7 @@ func (tc *TenantController) deleteCRDs(tenantId string) error {
 	}
 
 	for _, crd := range crdList.Items {
-		if strings.HasPrefix(crd.Spec.Group, tenantId) {
+		if strings.HasPrefix(crd.Spec.Group, tenantId+util.TenantIDSeparator) {
 			if err = tc.upstreamCRDClient.ApiextensionsV1().CustomResourceDefinitions().Delete(context.TODO(), crd.GetName(), metav1.DeleteOptions{}); err != nil {
 				if apierrors.IsNotFound(err) {
 					continue
@@ -548,7 +560,24 @@ func (tc *TenantController) deleteNonCRDClusterScopedResources(tenantId string, 
 		}
 
 		for _, resource := range resourceList.Items {
-			if strings.HasPrefix(resource.GetName(), tenantId) {
+			// ⚠️ The separator is load-bearing, and these two sites were the only
+			// ones in either repository that dropped it. Everything kubezoo names
+			// for a tenant comes from AddTenantIDPrefix, which is literally
+			// tenantID + "-" + input, and the contract's own ownership predicate
+			// (util.UpstreamObjectBelongsToTenant) has always required the dash.
+			//
+			// Without it, deleting a tenant deletes every cluster-scoped object
+			// whose name merely begins with the six characters of its id.
+			// ValidateTenantName checks length and RFC1123 and nothing else, so a
+			// tenant may be called "system" -- and tearing that one down was
+			// measured against a real 1.36 apiserver to delete 66 of the 70
+			// bootstrap ClusterRoles, including system:kube-controller-manager and
+			// system:kube-scheduler. The shipped controller RBAC does not save
+			// you: clusterroles and clusterrolebindings are exactly what it grants
+			// delete on. Nothing puts them back either -- rbac/bootstrap-roles is
+			// a post-start hook, not a running reconciler -- so the cluster stays
+			// broken until every apiserver restarts.
+			if strings.HasPrefix(resource.GetName(), tenantId+util.TenantIDSeparator) {
 				if _, _, err = rClient.Delete(context.TODO(), resource.GetName(), metav1.DeleteOptions{}); err != nil {
 					if apierrors.IsNotFound(err) {
 						continue
