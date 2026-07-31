@@ -104,9 +104,13 @@ spec:
             # 它要给每个租户签客户端证书,所以要私钥,不只是证书。
             - --client-ca-file=/etc/kubezoo/pki/ca.pem
             - --client-ca-key-file=/etc/kubezoo/pki/ca-key.pem
-            # 写进发给租户的那份 kubeconfig 里的地址。⚠️ 这是**租户从外面看到的**
-            # 地址,不是集群内的 Service 名 —— 填错了租户拿到的 kubeconfig 连不上。
-            - --kubezoo-address=kubezoo
+            # 写进发给租户的那份 kubeconfig 里的地址。
+            # ⚠️⚠️ **这是占位符,部署前必须替换。** 这里要填的是**租户从集群外面
+            # 访问到的地址**,不是集群内的 Service 名 —— 上一版这里就写着 `kubezoo`,
+            # 那是 Service 名,租户拿到的 kubeconfig 会指向一个它根本解析不了的主机。
+            # ⚠️ 而且它必须在 gateway 服务证书的 SAN 里(见 gen_pki.sh 的
+            # KUBERNETES_HOSTNAMES),否则租户连上去就是证书校验失败。
+            - --kubezoo-address=KUBEZOO_EXTERNAL_ADDRESS_PLACEHOLDER
             - --kubezoo-port=6443
             - --v=4
           volumeMounts:
