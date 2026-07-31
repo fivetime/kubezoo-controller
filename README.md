@@ -46,3 +46,28 @@ kubezoo-controller \
 ```
 make test            # 单测 + 需要真 apiserver 的控制器测试
 ```
+
+## 部署
+
+`config/setup/controller.yaml`(ServiceAccount + ClusterRole + 绑定 + Deployment)。
+
+⚠️ **先装 kubezoo-proxy** —— 控制器要从 kubezoo 读 Tenant 对象,而且它挂载的两个 Secret
+(`kubezoo-pki`、`kubezoo-controller-kubeconfig`)都是 proxy 仓库的 `hack/lib/gen_pki.sh` 建的。
+两个部署**必须共用同一份 CA**:控制器签给租户的证书,得是 kubezoo 认的那个 CA 签的。
+
+### ⭐⭐ 那份 ClusterRole 是平台对控制器的信任面
+
+最要紧的是 **`escalate` 和 `bind`**。RBAC 默认不允许任何人创建"授予了自己并不持有的权限"
+的角色,而控制器恰恰要这么做 —— 它给每个租户建 `<租户ID>-cluster-admin`,以及 `*` on `*`
+的 namespace admin 角色。这两个动词就是这条规则的官方豁免口。
+
+⇒ **能改这个 ServiceAccount 的人,等于能在集群里造出任意权限。**
+
+⚠️ 一个实测踩到的坑:**`bind` 要授在 `clusterroles` 上,不是 `clusterrolebindings` 上**。
+建绑定时的提权检查问的是"你对 **roleRef 指的那个角色** 有 bind 吗"。放错了会被拒成:
+
+```
+is attempting to grant RBAC permissions not currently held
+```
+
+—— 这条报错**完全不提 bind**,看不出是授权对象放错了地方。

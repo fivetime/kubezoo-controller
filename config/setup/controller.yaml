@@ -1,0 +1,125 @@
+# kubezoo-controller:把上游集群对账成 Tenant 声明的样子。
+#
+# ⚠️ 装这一份之前先装 kubezoo-proxy —— 控制器要从 kubezoo 读 Tenant 对象,
+# kubezoo 不在它就起不来。反过来只装 proxy 也不行:那样集群会接受 Tenant 对象
+# 然后什么都不做,而且没有任何报错说缺了什么。
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubezoo-controller
+---
+# ⭐⭐ 这份授权就是平台对控制器的信任面,值得逐条读,不要图省事换成 cluster-admin。
+#
+# 最要紧的是 escalate 和 bind:RBAC 默认不允许任何人创建一个"授予了自己并不持有的
+# 权限"的角色,而控制器恰恰要这么做 —— 它给每个租户建 `<租户ID>-cluster-admin`
+# 和 `*` on `*` 的 namespace admin 角色。escalate/bind 正是这条规则的官方豁免口。
+#
+# ⇒ 换句话说:**能改这个 ServiceAccount 的人,等于能在集群里造出任意权限。**
+# 它和 kubezoo 自己的凭据是平台里最该被看住的两个身份。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubezoo-controller
+rules:
+  # 租户的 namespace 由它创建;markFrozen 会改标签,所以要 update。
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+  # 每个 namespace 一条授权租户的 RoleBinding,以及 ClusterRoleBinding 的投影。
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # 租户的集群级角色,和从投影派生出来的那些。
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles", "clusterrolebindings"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # 上面那条允许"写这些对象",这一条允许"写进自己没有的权限"。分开列是为了让
+  # 它显眼:没有它,控制器建到一半就会被拒;有了它,它就是集群里的特权身份。
+  #
+  # ⚠️ 两个动词都授在 **clusterroles** 上,`bind` 尤其容易放错地方:
+  # 建 (Cluster)RoleBinding 时的提权检查问的是"你对 **roleRef 指的那个角色** 有
+  # bind 吗",而不是"你对 clusterrolebindings 有 bind 吗"。
+  # 实测把 bind 放在 clusterrolebindings 上,建绑定会被拒:
+  #   is attempting to grant RBAC permissions not currently held
+  # —— 而且那条报错完全不提 bind,看不出是授权对象放错了。
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    verbs: ["escalate", "bind"]
+
+  # 租户的 CRD 组决定了它的集群级角色里有哪些组,所以要 watch 变化。只读。
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch"]
+
+  # 集群配额是可选组件。上游没装的话控制器会跳过它,不会因此起不来 ——
+  # 但授权留在这里,免得装了配额之后还要回来改这份文件。
+  - apiGroups: ["quota.kubezoo.io"]
+    resources: ["clusterresourcequotas"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubezoo-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubezoo-controller
+subjects:
+  - kind: ServiceAccount
+    name: kubezoo-controller
+    namespace: default
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubezoo-controller
+spec:
+  # ⛔ 不要往上加。没有 leader 选举也没有分片,第二个副本就是第二份控制器在对账
+  # 同一批租户 —— 幂等的写扛得住,但投影的孤儿清理在并发下没测过。
+  # 终态应该是按租户 ID 分片而不是主从,见 README。
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubezoo-controller
+  template:
+    metadata:
+      labels:
+        app: kubezoo-controller
+    spec:
+      serviceAccountName: kubezoo-controller
+      containers:
+        - name: kubezoo-controller
+          image: kubezoo/kubezoo-controller:local-up
+          imagePullPolicy: IfNotPresent
+          args:
+            # Tenant 对象在 kubezoo 里,不在上游集群里。
+            - --kubezoo-kubeconfig=/etc/kubezoo/kubeconfig/kubezoo.kubeconfig
+            # 上游就是它自己跑的这个集群,所以用 in-cluster 配置 —— 上面那份
+            # ServiceAccount 授权就是给这条用的。
+            - --upstream-kubeconfig=
+            # 它要给每个租户签客户端证书,所以要私钥,不只是证书。
+            - --client-ca-file=/etc/kubezoo/pki/ca.pem
+            - --client-ca-key-file=/etc/kubezoo/pki/ca-key.pem
+            # 写进发给租户的那份 kubeconfig 里的地址。⚠️ 这是**租户从外面看到的**
+            # 地址,不是集群内的 Service 名 —— 填错了租户拿到的 kubeconfig 连不上。
+            - --kubezoo-address=kubezoo
+            - --kubezoo-port=6443
+            - --v=4
+          volumeMounts:
+            - name: kubezoo-pki
+              mountPath: /etc/kubezoo/pki
+            - name: kubezoo-kubeconfig
+              mountPath: /etc/kubezoo/kubeconfig
+      volumes:
+        # kubezoo-proxy 的 hack/lib/gen_pki.sh 建的,两个部署共用同一份 CA ——
+        # 控制器签出来的租户证书必须是 kubezoo 认的那个 CA 签的。
+        - name: kubezoo-pki
+          secret:
+            secretName: kubezoo-pki
+        - name: kubezoo-kubeconfig
+          secret:
+            secretName: kubezoo-controller-kubeconfig
