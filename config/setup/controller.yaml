@@ -1,6 +1,6 @@
 # kubezoo-controller:把上游集群对账成 Tenant 声明的样子。
 #
-# ⚠️ 装这一份之前先装 kubezoo-proxy —— 控制器要从 kubezoo 读 Tenant 对象,
+# ⚠️ 装这一份之前先装 kubezoo-gateway —— 控制器要从 kubezoo 读 Tenant 对象,
 # kubezoo 不在它就起不来。反过来只装 proxy 也不行:那样集群会接受 Tenant 对象
 # 然后什么都不做,而且没有任何报错说缺了什么。
 ---
@@ -115,7 +115,7 @@ spec:
             - name: kubezoo-kubeconfig
               mountPath: /etc/kubezoo/kubeconfig
       volumes:
-        # kubezoo-proxy 的 hack/lib/gen_pki.sh 建的,两个部署共用同一份 CA ——
+        # kubezoo-gateway 的 hack/lib/gen_pki.sh 建的,两个部署共用同一份 CA ——
         # 控制器签出来的租户证书必须是 kubezoo 认的那个 CA 签的。
         - name: kubezoo-pki
           secret:

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 在本机起一个租户控制器,对着已经跑起来的 kubezoo 和上游集群。
 #
-# 单独调控制器时可以直接用;kubezoo-proxy 的 hack/lab/up.sh 也调它 —— 那边
+# 单独调控制器时可以直接用;kubezoo-gateway 的 hack/lab/up.sh 也调它 —— 那边
 # 不该再抄一份怎么起控制器,抄了就会漂移。
 #
 # 用法:  up-controller.sh <工作目录> <kubezoo-kubeconfig> <upstream-kubeconfig> <CA目录> [kubezoo地址] [端口]
