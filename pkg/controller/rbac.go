@@ -664,6 +664,27 @@ func ownGroupRules(tenantID string, rules []rbacv1.PolicyRule) []rbacv1.PolicyRu
 // on kubezoo's filtering rather than on RBAC, and would have to be withheld from
 // anything not coming through kubezoo. That is a separate decision; see the
 // audit.
+// resolvedSubjects reads the record's subjects the way a RoleBinding's are read,
+// so that they are legal in the ClusterRoleBinding derived from them.
+//
+// ⚠️ A ServiceAccount subject may omit its namespace in a RoleBinding -- upstream
+// validation only requires one when the binding is cluster-scoped, and the
+// authorizer resolves it to the binding's own namespace. The record *is* a
+// RoleBinding, so such a subject is stored happily and then made the derived
+// ClusterRoleBinding invalid, which failed this sync and everything after it in
+// the tenant's reconcile -- certificate and kubeconfig upkeep, quota -- on every
+// pass, for one binding the tenant was allowed to write.
+func resolvedSubjects(record *rbacv1.RoleBinding) []rbacv1.Subject {
+	resolved := make([]rbacv1.Subject, 0, len(record.Subjects))
+	for _, subject := range record.Subjects {
+		if subject.Kind == rbacv1.ServiceAccountKind && subject.Namespace == "" {
+			subject.Namespace = record.Namespace
+		}
+		resolved = append(resolved, subject)
+	}
+	return resolved
+}
+
 func syncOwnGroupClusterBindings(rbacClient rbacclient.RbacV1Interface, tenantID string,
 	mode tenantv1alpha1.TenantSuspensionMode) error {
 
@@ -723,7 +744,7 @@ func syncOwnGroupClusterBindings(rbacClient rbacclient.RbacV1Interface, tenantID
 					Kind:     "ClusterRole",
 					Name:     name,
 				},
-				Subjects: record.Subjects,
+				Subjects: resolvedSubjects(record),
 			}
 		}
 	}

@@ -273,8 +273,14 @@ func (tc *TenantController) enqueueProjectionOwner(obj interface{}) {
 	if !ok {
 		return
 	}
-	tenantID, _, found := strings.Cut(binding.Namespace, "-")
-	if !found || tenantID == "" {
+	// ⚠️ Not strings.Cut on the first dash. A tenant id is a fixed six characters
+	// and ValidateTenantName permits a dash at any position after the first, so
+	// for a tenant like ab-cde the first-dash reading enqueued tenant "ab",
+	// onTenantUpdate got NotFound and dropped it, and the event-driven reconcile
+	// this informer exists to provide degraded to the ten-minute resync -- for
+	// exactly the tenants whose names carry a dash, and in silence.
+	tenantID, err := util.TenantIDFromPrefixed(binding.Namespace)
+	if err != nil {
 		return
 	}
 	tc.queue.Add(Event{tenantId: tenantID, eventType: Update})
@@ -288,8 +294,11 @@ func (tc *TenantController) enqueueCRDOwner(obj interface{}) {
 	if !ok {
 		return
 	}
-	tenantID, _, found := strings.Cut(crd.Spec.Group, "-")
-	if !found || tenantID == "" {
+	// Fixed-length prefix, for the same reason as enqueueProjectionOwner: a
+	// tenant whose name contains a dash was enqueued under a truncated id and
+	// its CRD events were dropped.
+	tenantID, err := util.TenantIDFromPrefixed(crd.Spec.Group)
+	if err != nil {
 		return
 	}
 	tc.queue.Add(Event{tenantId: tenantID, eventType: Update})
