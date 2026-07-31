@@ -139,7 +139,17 @@ func main() {
 		o.kubezooAddress,
 		o.kubezooPort)
 
-	tenantInformers.Start(stopCh)
+	// No Start here. controller.Run runs the informer it is handed -- that is its
+	// contract -- and calling Start as well produced client-go's "the
+	// sharedIndexInformer has started, run more than once is not allowed" on
+	// every boot.
+	//
+	// ⚠️ That side effect is worth being wary of rather than relying on: the
+	// gateway used to get its own tenant informer started the same way, by
+	// passing it to controller.Run, and taking the controller out of that process
+	// stopped the informer with nothing to say so. Here the informer and the
+	// thing that runs it are one line apart, which is the only reason this is
+	// safe to leave implicit.
 	klog.Info("kubezoo-controller running")
 	select {}
 }
