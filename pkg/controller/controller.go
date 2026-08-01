@@ -21,15 +21,17 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io/ioutil"
-	rbacv1 "k8s.io/api/rbac/v1"
 	"net"
 	"reflect"
 	"strconv"
 	"strings"
 
+	rbacv1 "k8s.io/api/rbac/v1"
+
+	"time"
+
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	externalinformer "k8s.io/apiextensions-apiserver/pkg/client/informers/externalversions"
-	"time"
 
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
@@ -123,7 +125,11 @@ func newTenantController(ti cache.SharedIndexInformer, tenantCli tenantclient.Te
 		}
 		queue.Add(Event{tenantId: tenantId, eventType: eventType})
 	}
-	ti.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	// Checked, like every other AddEventHandler in this file. This is the one
+	// that watches Tenants themselves, so a registration that failed would leave
+	// the controller running and reconciling nothing at all -- no namespaces, no
+	// RBAC, no certificates -- with no error anywhere.
+	if _, err := ti.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			enqueue(obj, Create, cache.MetaNamespaceKeyFunc)
 		},
@@ -133,7 +139,9 @@ func newTenantController(ti cache.SharedIndexInformer, tenantCli tenantclient.Te
 		DeleteFunc: func(obj interface{}) {
 			enqueue(obj, Delete, cache.DeletionHandlingMetaNamespaceKeyFunc)
 		},
-	})
+	}); err != nil {
+		utilruntime.HandleError(fmt.Errorf("watching tenants: %w", err))
+	}
 
 	return &TenantController{
 		queue:                   queue,
@@ -904,10 +912,20 @@ func syncNamespaces(coreClient v1.CoreV1Interface, tenantId string) error {
 // genCertAndKubeconfig signs the certificate/key and generates the kubeconfig for the tenant;
 // the generated kubeconfig will be attached in the tenant's annotation.
 func genCertAndKubeconfig(tenantCli tenantclient.TenantV1alpha1Interface, tenantId string, tenantlister tenantlister.TenantLister, clientCAFile, clientCAKeyFile, kubeZooHostAddress string) error {
-	tenant, err := tenantlister.Get(tenantId)
+	cached, err := tenantlister.Get(tenantId)
 	if err != nil {
 		return errors.Errorf("Error fetching object with key %s from store: %v", tenantId, err)
 	}
+	// ⚠️ Copied. The lister hands back the informer's own object, and this
+	// function writes the kubeconfig annotation into it before calling Update.
+	// When that Update failed -- a webhook, a 500, a missing permission -- the
+	// error was returned and the item requeued, but the cache now carried the
+	// annotation, so the retry took the "already generated" early return and
+	// reported success. The tenant ended up fully provisioned and never handed
+	// credentials, with one klog.Warningf as the only trace, until a full re-LIST
+	// or a controller restart cleared the poisoned entry. A persistent rejection
+	// turned into a permanently green reconcile.
+	tenant := cached.DeepCopy()
 	// 1. return if Kubeconfig is already generated
 	if len(tenant.Annotations) != 0 && tenant.Annotations[util.AnnotationTenantKubeConfigBase64] != "" {
 		return nil

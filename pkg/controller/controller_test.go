@@ -31,8 +31,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/klog"
 
-	"github.com/fivetime/kubezoo-contract/pkg/util"
 	tenantv1alpha1 "github.com/fivetime/kubezoo-contract/pkg/apis/tenant/v1alpha1"
+	"github.com/fivetime/kubezoo-contract/pkg/util"
 )
 
 var _ = Describe("Tenant controller", func() {

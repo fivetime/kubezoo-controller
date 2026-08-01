@@ -1,0 +1,55 @@
+version: "2"
+
+run:
+  timeout: 10m
+  tests: true
+  modules-download-mode: readonly
+
+linters:
+  default: none
+  enable:
+    - bodyclose
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    # ⚠️ Separate from staticcheck in golangci-lint v2: enabling staticcheck's
+    # "all" does NOT turn on U1000. Its absence let a fix ship that was written
+    # and never called -- the commit message said both endpoints now refused,
+    # the audit doc listed the leak as closed, and neither was true, because an
+    # unused package-level function compiles and every test stayed green. It
+    # also found a port that kept a destroy method and lost its one caller.
+    - unused
+  settings:
+    govet:
+      disable:
+        - composites
+    staticcheck:
+      checks:
+        - all
+        - -QF*
+        - -SA1019
+        - -ST*
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters: [errcheck]
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/fivetime/kubezoo-controller
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

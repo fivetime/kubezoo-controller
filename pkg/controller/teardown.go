@@ -124,6 +124,24 @@ func (tc *TenantController) stripFinalizersForResource(namespace string, apiReso
 		if apierrors.IsNotFound(err) || apierrors.IsMethodNotSupported(err) || apierrors.IsServiceUnavailable(err) {
 			return 0, nil
 		}
+		// ⚠️ Forbidden too, and loudly. This walks every namespaced resource
+		// upstream advertises with list and patch, while the controller is
+		// deliberately not cluster-admin: measured against a real 1.36 apiserver
+		// with the shipped ClusterRole, 32 resources considered and exactly one
+		// allowed. Returning here aborted the whole of deleteResources on the
+		// first denial, so the Tenant finalizer was never removed, the Tenant
+		// stayed Terminating for good, and deleteClusterResourceQuota was never
+		// reached -- while the stranded finalizers this function exists to clear
+		// stayed exactly where they were. Continuing means an object with a
+		// finalizer in a resource we cannot see may still strand its namespace;
+		// that is visible as a namespace stuck Terminating, which is the loud
+		// failure, and it no longer takes the rest of the teardown down with it.
+		if apierrors.IsForbidden(err) {
+			klog.Warningf("cannot list %s in %s while tearing down, so a finalizer there will not "+
+				"be cleared and that namespace may stay Terminating; grant the controller "+
+				"list and patch on %s: %v", apiResource.Name, namespace, apiResource.Name, err)
+			return 0, nil
+		}
 		return 0, fmt.Errorf("listing %s in %s: %w", apiResource.Name, namespace, err)
 	}
 

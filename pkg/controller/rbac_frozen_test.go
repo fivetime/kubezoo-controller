@@ -24,8 +24,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/fivetime/kubezoo-contract/pkg/common"
 	tenantv1alpha1 "github.com/fivetime/kubezoo-contract/pkg/apis/tenant/v1alpha1"
+	"github.com/fivetime/kubezoo-contract/pkg/common"
 )
 
 func namespaceOf(t *testing.T, client *fake.Clientset, name string) *corev1.Namespace {
