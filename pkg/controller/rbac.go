@@ -157,7 +157,7 @@ func tenantClusterRole(tenantID string) string {
 // apiGroup is a literal or "*", and "111111-*" is neither. So the rules are
 // rebuilt from the tenant's CRDs on every pass, and a CRD added or removed
 // shows up on the next resync.
-func ownCustomResourceRules(tenantID string, crdClient *apiextensions.Clientset) []rbacv1.PolicyRule {
+func ownCustomResourceRules(tenantID string, crdClient apiextensions.Interface) []rbacv1.PolicyRule {
 	if crdClient == nil {
 		return nil
 	}
@@ -190,7 +190,7 @@ func ownCustomResourceRules(tenantID string, crdClient *apiextensions.Clientset)
 
 func syncClusterRoles(coreClient v1.CoreV1Interface, rbacClient rbacclient.RbacV1Interface, tenantID string,
 	mode tenantv1alpha1.TenantSuspensionMode,
-	crdClient *apiextensions.Clientset) error {
+	crdClient apiextensions.Interface) error {
 	if _, err := rbacClient.ClusterRoles().List(context.TODO(), metav1.ListOptions{ResourceVersion: "0"}); err != nil {
 		klog.Warningf("Failed to list the clusterroles %s with error %v", tenantID, err)
 		return err

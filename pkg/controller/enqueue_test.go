@@ -25,8 +25,12 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/util/workqueue"
+
+	crdfake "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	kubezoodynamic "github.com/fivetime/kubezoo-contract/pkg/dynamic"
 )
@@ -167,6 +171,63 @@ func TestTeardownRequiresTheSeparator(t *testing.T) {
 			if !reflect.DeepEqual(upstream.deleted, tc.want) {
 				t.Errorf("tearing down tenant %q deleted %v, want %v",
 					tc.tenantID, upstream.deleted, tc.want)
+			}
+		})
+	}
+}
+
+// TestDeleteCRDsRequiresTheSeparator is the other half of the separator fix.
+//
+// ⚠️ The commit that added the separator fixed both sites and guarded only one.
+// Reverting deleteCRDs to the bare prefix left the whole controller suite green,
+// envtest included. The consequence is the wider of the two: a tenant may be
+// called "cilium" -- ValidateTenantName checks length six and RFC1123 characters
+// and nothing else -- and tearing that tenant down then deleted the CRD for
+// group cilium.io, which cascades to every CiliumNetworkPolicy, CiliumEndpoint
+// and CiliumIdentity in the cluster. Nothing recreates them.
+func TestDeleteCRDsRequiresTheSeparator(t *testing.T) {
+	cases := []struct {
+		tenantID string
+		groups   []string
+		want     []string
+	}{
+		{
+			tenantID: "cilium",
+			groups:   []string{"cilium.io", "cilium-mine.example.com", "cilium.io.v2"},
+			// Only the one carrying the separator belongs to the tenant.
+			want: []string{"widgets.cilium-mine.example.com"},
+		},
+		{
+			tenantID: "111111",
+			groups:   []string{"111111-example.com", "1111112-example.com", "example.com"},
+			want:     []string{"widgets.111111-example.com"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.tenantID, func(t *testing.T) {
+			objects := make([]runtime.Object, 0, len(tc.groups))
+			for _, group := range tc.groups {
+				objects = append(objects, &apiextensionsv1.CustomResourceDefinition{
+					ObjectMeta: metav1.ObjectMeta{Name: "widgets." + group},
+					Spec:       apiextensionsv1.CustomResourceDefinitionSpec{Group: group},
+				})
+			}
+			client := crdfake.NewSimpleClientset(objects...)
+			controller := &TenantController{upstreamCRDClient: client}
+			if err := controller.deleteCRDs(tc.tenantID); err != nil {
+				t.Fatalf("deleteCRDs: %v", err)
+			}
+
+			var deleted []string
+			for _, action := range client.Actions() {
+				if action.GetVerb() == "delete" {
+					deleted = append(deleted, action.(k8stesting.DeleteAction).GetName())
+				}
+			}
+			if !reflect.DeepEqual(deleted, tc.want) {
+				t.Errorf("tearing down tenant %q deleted CRDs %v, want %v",
+					tc.tenantID, deleted, tc.want)
 			}
 		})
 	}

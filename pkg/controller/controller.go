@@ -96,16 +96,18 @@ type TenantController struct {
 	clusterquotaCli         quotaclient.QuotaV1alpha1Interface
 	upstreamDiscoveryClient *discovery.DiscoveryClient
 	upstreamDynamicClient   dynamic.Interface
-	upstreamCRDClient       *apiextensions.Clientset
-	upstreamCoreClient      v1.CoreV1Interface
-	upstreamRbacClient      rbacclient.RbacV1Interface
-	clientCAFile            string
-	clientCAKeyFile         string
-	kubeZooHostAddress      string
+	// The generated interface rather than the concrete Clientset, so that the
+	// teardown predicates can be driven in a test. Nothing else changes.
+	upstreamCRDClient  apiextensions.Interface
+	upstreamCoreClient v1.CoreV1Interface
+	upstreamRbacClient rbacclient.RbacV1Interface
+	clientCAFile       string
+	clientCAKeyFile    string
+	kubeZooHostAddress string
 }
 
 // newTenantController create a controller to handler the events of tenant.
-func newTenantController(ti cache.SharedIndexInformer, tenantCli tenantclient.TenantV1alpha1Interface, coreCli v1.CoreV1Interface, rbacCli rbacclient.RbacV1Interface, quotaClient quotaclient.QuotaV1alpha1Interface, discoveryCli *discovery.DiscoveryClient, dynamicCli dynamic.Interface, crdClient *apiextensions.Clientset, clientCAFile, clientCAKeyFile, kubeZooBindAddress string, kubeZooSecurePort int) *TenantController {
+func newTenantController(ti cache.SharedIndexInformer, tenantCli tenantclient.TenantV1alpha1Interface, coreCli v1.CoreV1Interface, rbacCli rbacclient.RbacV1Interface, quotaClient quotaclient.QuotaV1alpha1Interface, discoveryCli *discovery.DiscoveryClient, dynamicCli dynamic.Interface, crdClient apiextensions.Interface, clientCAFile, clientCAKeyFile, kubeZooBindAddress string, kubeZooSecurePort int) *TenantController {
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 	// Each handler builds its own event. They used to share one Event value and
 	// one err declared out here, mutating it field by field before queueing it:
@@ -151,7 +153,7 @@ func newTenantController(ti cache.SharedIndexInformer, tenantCli tenantclient.Te
 }
 
 // Run starts the tenant controller
-func Run(stopCh <-chan struct{}, ti cache.SharedIndexInformer, tenantCli tenantclient.TenantV1alpha1Interface, typedCli kubernetes.Interface, discoveryCli *discovery.DiscoveryClient, dynamicCli dynamic.Interface, crdClient *apiextensions.Clientset, quotaClient quotaclient.QuotaV1alpha1Interface, clientCAFile, clientCAKeyFile, kubeZooBindAddress string, kubeZooSecurePort int) {
+func Run(stopCh <-chan struct{}, ti cache.SharedIndexInformer, tenantCli tenantclient.TenantV1alpha1Interface, typedCli kubernetes.Interface, discoveryCli *discovery.DiscoveryClient, dynamicCli dynamic.Interface, crdClient apiextensions.Interface, quotaClient quotaclient.QuotaV1alpha1Interface, clientCAFile, clientCAKeyFile, kubeZooBindAddress string, kubeZooSecurePort int) {
 	tc := newTenantController(ti, tenantCli, typedCli.CoreV1(), typedCli.RbacV1(), quotaClient, discoveryCli, dynamicCli, crdClient, clientCAFile, clientCAKeyFile, kubeZooBindAddress, kubeZooSecurePort)
 	defer utilruntime.HandleCrash()
 	defer tc.queue.ShutDown()
@@ -488,7 +490,7 @@ func (tc *TenantController) deleteResources(tenantId string) error {
 		return errors.Errorf("fail to clear finalizers for tenant %s: %v", tenantId, err)
 	}
 
-	if err := tc.syncClusterResourceQuota(tenantId); err != nil {
+	if err := tc.deleteClusterResourceQuota(tenantId); err != nil {
 		return errors.Errorf("fail to delete clusterResourceQuota for tenant %s: %v", tenantId, err)
 	}
 
@@ -556,6 +558,23 @@ func (tc *TenantController) deleteNonCRDClusterScopedResources(tenantId string, 
 			if apierrors.IsNotFound(err) {
 				continue
 			}
+			// ⚠️ Forbidden is expected here and must not stop the sweep. This
+			// loop walks *every* cluster-scoped resource upstream advertises with
+			// list and delete -- nodes, apiservices, storageclasses, csidrivers,
+			// priorityclasses -- almost none of which a tenant could ever have
+			// created, and the controller is deliberately not cluster-admin. A
+			// SubjectAccessReview census under the shipped manifest found only 2
+			// of 26 both listable and deletable, so returning here aborted every
+			// teardown at the first one: the finalizer was never removed, the
+			// Tenant stayed Terminating for good, and the operator's natural
+			// remedy -- stripping the finalizer by hand -- left the tenant's
+			// namespaces, secrets and custom resources behind for the next holder
+			// of that six-character id.
+			if apierrors.IsForbidden(err) {
+				klog.V(4).Infof("not listing %s while tearing down tenant %s, which is fine "+
+					"unless a tenant can create one: %v", gvr.String(), tenantId, err)
+				continue
+			}
 			return err
 		}
 
@@ -580,6 +599,16 @@ func (tc *TenantController) deleteNonCRDClusterScopedResources(tenantId string, 
 			if strings.HasPrefix(resource.GetName(), tenantId+util.TenantIDSeparator) {
 				if _, _, err = rClient.Delete(context.TODO(), resource.GetName(), metav1.DeleteOptions{}); err != nil {
 					if apierrors.IsNotFound(err) {
+						continue
+					}
+					if apierrors.IsForbidden(err) {
+						// Different from the list above: this object really is the
+						// tenant's and really is being left behind, so it is a
+						// warning rather than a V(4) -- but it still must not wedge
+						// the teardown, or nothing else gets cleaned up either.
+						klog.Warningf("cannot delete %s %s belonging to tenant %s, leaving it behind; "+
+							"grant the controller delete on %s: %v",
+							gvr.String(), resource.GetName(), tenantId, gvr.Resource, err)
 						continue
 					}
 					return err
@@ -709,6 +738,33 @@ func (tc *TenantController) syncResources(tenantId string) error {
 	if err := genCertAndKubeconfig(tc.tenantClient, tenantId, tc.tenantLister, tc.clientCAFile, tc.clientCAKeyFile, tc.kubeZooHostAddress); err != nil {
 		return err
 	}
+	return nil
+}
+
+// deleteClusterResourceQuota removes the tenant's quota during teardown.
+//
+// ⚠️ Teardown used to call syncClusterResourceQuota, which deletes the quota only
+// on the branch where the Tenant is already NotFound -- and during teardown it is
+// not: the finalizer is still on it, which is the whole reason this code is
+// running. Worse, the function returns early whenever a deletionTimestamp is set,
+// so it did nothing at all and reported success. The finalizer was then removed,
+// the Tenant vanished, and no later event reached the delete branch: the
+// finalizer-removal update returns on NotFound, and the informer's Delete event
+// only logs. The cluster-scoped quota was orphaned for good, and a reused tenant
+// id inherited the previous tenant's limits.
+func (tc *TenantController) deleteClusterResourceQuota(tenantID string) error {
+	if tc.clusterquotaCli == nil {
+		return nil
+	}
+	name := fmt.Sprintf("%s-%s", common.TenantQuotaNamePrefix, tenantID)
+	if err := tc.clusterquotaCli.ClusterResourceQuotas().Delete(
+		context.TODO(), name, metav1.DeleteOptions{}); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	klog.Infof("delete cluster resource quota (%s) for tenant %s", name, tenantID)
 	return nil
 }
 

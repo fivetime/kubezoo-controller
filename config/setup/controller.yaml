@@ -23,9 +23,12 @@ metadata:
   name: kubezoo-controller
 rules:
   # 租户的 namespace 由它创建;markFrozen 会改标签,所以要 update。
+  # ⚠️ delete 是拆除必需的,漏了它 deleteResources 会在第一步就 403,finalizer
+  # 永远不摘,Tenant 永远 Terminating —— 而运维顺手把 finalizer 剥掉之后,租户的
+  # namespace、secret 和 CR 就全留下了,等着下一个拿到同一个六位 id 的人。
   - apiGroups: [""]
     resources: ["namespaces"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
   # 每个 namespace 一条授权租户的 RoleBinding,以及 ClusterRoleBinding 的投影。
   - apiGroups: ["rbac.authorization.k8s.io"]
@@ -49,10 +52,34 @@ rules:
     resources: ["clusterroles"]
     verbs: ["escalate", "bind"]
 
-  # 租户的 CRD 组决定了它的集群级角色里有哪些组,所以要 watch 变化。只读。
+  # 租户的 CRD 组决定了它的集群级角色里有哪些组,所以要 watch 变化 —— 而拆除时
+  # 还要删掉它们(删 CRD 会级联删掉该类型的全部 CR,这是清掉租户自定义资源的
+  # 唯一办法)。
   - apiGroups: ["apiextensions.k8s.io"]
     resources: ["customresourcedefinitions"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "delete"]
+
+  # 拆除时逐个集群级资源扫一遍,删掉名字带租户前缀的。⭐ 这里只需要列出
+  # **租户自己能创建的**集群级资源 —— 也就是 kubezoo-contract 的
+  # ClusterScopedRules 授出去的那一组,再加上它们的 CRD。别的集群级资源
+  # (nodes、apiservices、storageclasses……)租户根本建不出来,扫到 Forbidden
+  # 会被跳过并记 V(4),不再中断拆除。
+  #
+  # ⚠️ 这份清单和 ClusterScopedRules 必须一起改:那边多授一种租户能建的集群级
+  # 资源,这边不跟上,那种对象就会在租户删除后永久留下,而唯一的迹象是一条
+  # Warning 日志。
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingressclasses"]
+    verbs: ["list", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["list", "delete"]
+  - apiGroups: ["node.k8s.io"]
+    resources: ["runtimeclasses"]
+    verbs: ["list", "delete"]
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["validatingwebhookconfigurations", "mutatingwebhookconfigurations"]
+    verbs: ["list", "delete"]
 
   # 集群配额是可选组件。上游没装的话控制器会跳过它,不会因此起不来 ——
   # 但授权留在这里,免得装了配额之后还要回来改这份文件。
