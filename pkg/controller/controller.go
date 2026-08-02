@@ -870,9 +870,7 @@ func syncNamespaces(coreClient v1.CoreV1Interface, tenantId string) error {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      tenantId + "-" + systemNamespace,
 				Namespace: "",
-				Labels: map[string]string{
-					common.TenantNamespaceLabelKey: tenantId,
-				},
+				Labels:    tenantNamespaceLabels(tenantId),
 			},
 		}
 		ns, err := coreClient.Namespaces().Get(context.TODO(), expectNamespace.Name, metav1.GetOptions{})
@@ -896,8 +894,14 @@ func syncNamespaces(coreClient v1.CoreV1Interface, tenantId string) error {
 		if ns.Labels == nil {
 			ns.Labels = make(map[string]string)
 		}
-		if ns.Labels[common.TenantNamespaceLabelKey] != tenantId {
-			ns.Labels[common.TenantNamespaceLabelKey] = tenantId
+		drifted := false
+		for key, want := range tenantNamespaceLabels(tenantId) {
+			if ns.Labels[key] != want {
+				ns.Labels[key] = want
+				drifted = true
+			}
+		}
+		if drifted {
 			// TODO: retry on conflict
 			_, err := coreClient.Namespaces().Update(context.TODO(), ns, metav1.UpdateOptions{})
 			if err != nil {
@@ -907,6 +911,31 @@ func syncNamespaces(coreClient v1.CoreV1Interface, tenantId string) error {
 		}
 	}
 	return nil
+}
+
+// tenantNamespaceLabels are the labels every tenant namespace must carry.
+//
+// ⭐ The Pod Security ones are here, and not left to the Kyverno policy that also
+// writes them, because Pod Security Admission runs INSIDE the apiserver -- no
+// webhook, no single point. A namespace carrying the label refuses host
+// namespaces, privileged containers and host paths with every webhook in the
+// cluster gone, which makes it the one piece of real depth in the pod surface.
+//
+// ⛔ Until this, the label was written only by a Kyverno mutate, so the second
+// layer was installed by the first: a namespace created while that webhook was
+// not registered carried no label and got no enforcement at all. failurePolicy:
+// Fail does not cover it -- that covers a webhook which fails, not one which was
+// never registered, and the latter is the failure that actually happened.
+//
+// Written on create and repaired by the loop above, so a namespace that drifted
+// -- or that a tenant weakened -- is put back on the next sync rather than
+// needing an administrator.
+func tenantNamespaceLabels(tenantId string) map[string]string {
+	return map[string]string{
+		common.TenantNamespaceLabelKey:           tenantId,
+		common.PodSecurityEnforceLabelKey:        common.PodSecurityLevel,
+		common.PodSecurityEnforceVersionLabelKey: common.PodSecurityVersion,
+	}
 }
 
 // genCertAndKubeconfig signs the certificate/key and generates the kubeconfig for the tenant;
