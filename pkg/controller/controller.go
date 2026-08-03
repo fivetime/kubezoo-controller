@@ -25,6 +25,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 
@@ -90,14 +91,18 @@ type Event struct {
 // TenantController take responsibility for tenant management including
 // the tenant object, tenant certificate and the tenant's k8s resources.
 type TenantController struct {
-	queue                   workqueue.RateLimitingInterface
-	tenantInformer          cache.SharedIndexInformer
-	namespaceInformer       cache.SharedIndexInformer
-	tenantLister            tenantlister.TenantLister
-	tenantClient            tenantclient.TenantV1alpha1Interface
-	clusterquotaCli         quotaclient.QuotaV1alpha1Interface
-	upstreamDiscoveryClient *discovery.DiscoveryClient
-	upstreamDynamicClient   dynamic.Interface
+	queue             workqueue.RateLimitingInterface
+	tenantInformer    cache.SharedIndexInformer
+	namespaceInformer cache.SharedIndexInformer
+	tenantLister      tenantlister.TenantLister
+	tenantClient      tenantclient.TenantV1alpha1Interface
+	clusterquotaCli   quotaclient.QuotaV1alpha1Interface
+	// quotaUnenforceableReported remembers which tenants have already been told
+	// about, so a permanent misconfiguration is reported once per tenant rather
+	// than once per resync.
+	quotaUnenforceableReported sync.Map
+	upstreamDiscoveryClient    *discovery.DiscoveryClient
+	upstreamDynamicClient      dynamic.Interface
 	// The generated interface rather than the concrete Clientset, so that the
 	// teardown predicates can be driven in a test. Nothing else changes.
 	upstreamCRDClient  apiextensions.Interface
@@ -776,9 +781,50 @@ func (tc *TenantController) deleteClusterResourceQuota(tenantID string) error {
 	return nil
 }
 
+// reportQuotaUnenforceable says out loud that a tenant's quota is not being
+// enforced, but only when the tenant actually asked for one.
+//
+// ⛔ This used to be a single klog.Warning saying the sync was skipped, which
+// read like "you did not enable an optional feature" -- and that is exactly how
+// it was missed. The upstream cluster only serves quota.kubezoo.io if a
+// ClusterResourceQuota CRD is registered, no manifest in any of the three
+// repositories contains one, and nothing generates one, so clusterQuotaClient
+// returns nil in EVERY deployment path. A tenant with spec.quota set has simply
+// never had it enforced, and the only trace was that one line.
+//
+// ⚠️ Silence is right when the tenant asked for nothing: quota really is
+// optional and a cluster without it should not be nagged. What is not right is
+// being quiet when a tenant DID ask. That difference is the whole point of this
+// function, and it is why the check reads the tenant rather than logging up
+// front.
+//
+// Reported once per tenant per process. This runs on every resync for every
+// tenant, so an unconditional error would bury the cluster in a line that says
+// the same thing forever.
+func (tc *TenantController) reportQuotaUnenforceable(tenantID string) {
+	if tc.tenantClient == nil {
+		// Nothing to read the tenant with; the old message is all that can be said.
+		klog.Warning("Skip synchronize cluster resource quota since nil tenant client.")
+		return
+	}
+	tenant, err := tc.tenantClient.Tenants().Get(context.TODO(), tenantID, metav1.GetOptions{})
+	if err != nil || len(tenant.Spec.Quota.Hard) == 0 {
+		// No quota asked for, or the tenant is gone. Optional means optional.
+		return
+	}
+	if _, told := tc.quotaUnenforceableReported.LoadOrStore(tenantID, true); told {
+		return
+	}
+	klog.Errorf("tenant %s sets spec.quota but NO QUOTA IS BEING ENFORCED for it: the upstream "+
+		"cluster does not serve quota.kubezoo.io clusterresourcequotas, so the cluster resource "+
+		"quota client could not be built. Register the ClusterResourceQuota CRD upstream before "+
+		"relying on tenant quotas -- until then this tenant can consume the cluster without limit",
+		tenantID)
+}
+
 func (tc *TenantController) syncClusterResourceQuota(tenantID string) error {
 	if tc.tenantClient == nil || tc.clusterquotaCli == nil {
-		klog.Warning("Skip synchronize cluster resource quota since nil tenant or clusterResourceQuota client.")
+		tc.reportQuotaUnenforceable(tenantID)
 		return nil
 	}
 	tenantQuotaName := fmt.Sprintf("%s-%s", common.TenantQuotaNamePrefix, tenantID)
