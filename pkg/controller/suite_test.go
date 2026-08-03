@@ -153,6 +153,7 @@ var _ = BeforeSuite(func() {
 			// 0: the envtest suite asserts on the kubeconfig annotation, and a
 			// retention window would race it away mid-test.
 			0,
+			0, 0,
 		)
 	}()
 }, 60)

@@ -114,10 +114,14 @@ type TenantController struct {
 	// credentialRetention is how long the platform keeps its copy of a tenant's
 	// kubeconfig -- and so of the tenant's private key -- after issuing it.
 	credentialRetention time.Duration
+	// credentialValidity is the validity issued to a tenant that asks for none,
+	// and credentialValidityCeiling is the longest one that will be honoured.
+	credentialValidity        time.Duration
+	credentialValidityCeiling time.Duration
 }
 
 // newTenantController create a controller to handler the events of tenant.
-func newTenantController(ti cache.SharedIndexInformer, tenantCli tenantclient.TenantV1alpha1Interface, coreCli v1.CoreV1Interface, rbacCli rbacclient.RbacV1Interface, quotaClient quotaclient.QuotaV1alpha1Interface, discoveryCli *discovery.DiscoveryClient, dynamicCli dynamic.Interface, crdClient apiextensions.Interface, clientCAFile, clientCAKeyFile, kubeZooBindAddress string, kubeZooSecurePort int, credentialRetention time.Duration) *TenantController {
+func newTenantController(ti cache.SharedIndexInformer, tenantCli tenantclient.TenantV1alpha1Interface, coreCli v1.CoreV1Interface, rbacCli rbacclient.RbacV1Interface, quotaClient quotaclient.QuotaV1alpha1Interface, discoveryCli *discovery.DiscoveryClient, dynamicCli dynamic.Interface, crdClient apiextensions.Interface, clientCAFile, clientCAKeyFile, kubeZooBindAddress string, kubeZooSecurePort int, credentialRetention, credentialValidity, credentialValidityCeiling time.Duration) *TenantController {
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 	// Each handler builds its own event. They used to share one Event value and
 	// one err declared out here, mutating it field by field before queueing it:
@@ -152,26 +156,28 @@ func newTenantController(ti cache.SharedIndexInformer, tenantCli tenantclient.Te
 	}
 
 	return &TenantController{
-		queue:                   queue,
-		tenantInformer:          ti,
-		tenantLister:            tenantlister.NewTenantLister(ti.GetIndexer()),
-		tenantClient:            tenantCli,
-		upstreamCoreClient:      coreCli,
-		upstreamRbacClient:      rbacCli,
-		clusterquotaCli:         quotaClient,
-		upstreamDiscoveryClient: discoveryCli,
-		upstreamDynamicClient:   dynamicCli,
-		upstreamCRDClient:       crdClient,
-		clientCAFile:            clientCAFile,
-		clientCAKeyFile:         clientCAKeyFile,
-		kubeZooHostAddress:      net.JoinHostPort(kubeZooBindAddress, strconv.Itoa(kubeZooSecurePort)),
-		credentialRetention:     credentialRetention,
+		queue:                     queue,
+		tenantInformer:            ti,
+		tenantLister:              tenantlister.NewTenantLister(ti.GetIndexer()),
+		tenantClient:              tenantCli,
+		upstreamCoreClient:        coreCli,
+		upstreamRbacClient:        rbacCli,
+		clusterquotaCli:           quotaClient,
+		upstreamDiscoveryClient:   discoveryCli,
+		upstreamDynamicClient:     dynamicCli,
+		upstreamCRDClient:         crdClient,
+		clientCAFile:              clientCAFile,
+		clientCAKeyFile:           clientCAKeyFile,
+		kubeZooHostAddress:        net.JoinHostPort(kubeZooBindAddress, strconv.Itoa(kubeZooSecurePort)),
+		credentialRetention:       credentialRetention,
+		credentialValidity:        credentialValidity,
+		credentialValidityCeiling: credentialValidityCeiling,
 	}
 }
 
 // Run starts the tenant controller
-func Run(stopCh <-chan struct{}, ti cache.SharedIndexInformer, tenantCli tenantclient.TenantV1alpha1Interface, typedCli kubernetes.Interface, discoveryCli *discovery.DiscoveryClient, dynamicCli dynamic.Interface, crdClient apiextensions.Interface, quotaClient quotaclient.QuotaV1alpha1Interface, clientCAFile, clientCAKeyFile, kubeZooBindAddress string, kubeZooSecurePort int, credentialRetention time.Duration) {
-	tc := newTenantController(ti, tenantCli, typedCli.CoreV1(), typedCli.RbacV1(), quotaClient, discoveryCli, dynamicCli, crdClient, clientCAFile, clientCAKeyFile, kubeZooBindAddress, kubeZooSecurePort, credentialRetention)
+func Run(stopCh <-chan struct{}, ti cache.SharedIndexInformer, tenantCli tenantclient.TenantV1alpha1Interface, typedCli kubernetes.Interface, discoveryCli *discovery.DiscoveryClient, dynamicCli dynamic.Interface, crdClient apiextensions.Interface, quotaClient quotaclient.QuotaV1alpha1Interface, clientCAFile, clientCAKeyFile, kubeZooBindAddress string, kubeZooSecurePort int, credentialRetention, credentialValidity, credentialValidityCeiling time.Duration) {
+	tc := newTenantController(ti, tenantCli, typedCli.CoreV1(), typedCli.RbacV1(), quotaClient, discoveryCli, dynamicCli, crdClient, clientCAFile, clientCAKeyFile, kubeZooBindAddress, kubeZooSecurePort, credentialRetention, credentialValidity, credentialValidityCeiling)
 	defer utilruntime.HandleCrash()
 	defer tc.queue.ShutDown()
 
@@ -752,7 +758,7 @@ func (tc *TenantController) syncResources(tenantId string) error {
 	if isFreeze(mode) {
 		tc.reportBindingsFreezingDoesNotReach(tenantId)
 	}
-	if err := genCertAndKubeconfig(tc.tenantClient, tenantId, tc.tenantLister, tc.clientCAFile, tc.clientCAKeyFile, tc.kubeZooHostAddress); err != nil {
+	if err := genCertAndKubeconfig(tc.tenantClient, tenantId, tc.tenantLister, tc.clientCAFile, tc.clientCAKeyFile, tc.kubeZooHostAddress, tc.credentialValidity, tc.credentialValidityCeiling); err != nil {
 		return err
 	}
 	// ⚠️ After issuing, not instead of it, and on every reconcile rather than on a
@@ -760,12 +766,18 @@ func (tc *TenantController) syncResources(tenantId string) error {
 	// at all: nothing else revisits a tenant that has stopped changing, and a
 	// tenant that has stopped changing is exactly the one whose credential has
 	// been sitting there longest.
-	current, err := tc.tenantLister.Get(tenantId)
-	if err != nil {
-		return errors.Errorf("Error fetching object with key %s from store: %v", tenantId, err)
-	}
-	if err := withdrawCollectedCredential(tc.tenantClient, current, tc.credentialRetention, time.Now()); err != nil {
-		return err
+	//
+	// ⛔ And it can NEVER fail this reconcile. Dropping a stored copy of an
+	// already-delivered credential is housekeeping; namespaces, RBAC and quota
+	// are not. The first version returned both errors from here, which meant a
+	// lister miss or a conflicting write turned a tenant's whole reconcile into a
+	// failure and a backoff -- and a tenant whose RBAC converges late shows up as
+	// a ServiceAccount refused a grant it demonstrably has, which is nothing like
+	// a credential problem to look at.
+	if current, err := tc.tenantLister.Get(tenantId); err != nil {
+		klog.V(4).Infof("skipping the credential retention check for tenant(%s): %v", tenantId, err)
+	} else if err := withdrawCollectedCredential(tc.tenantClient, current, tc.credentialRetention, time.Now()); err != nil {
+		klog.Warningf("could not withdraw the stored credential of tenant(%s), will retry next resync: %v", tenantId, err)
 	}
 	return nil
 }
@@ -1002,7 +1014,7 @@ func tenantNamespaceLabels(tenantId string) map[string]string {
 
 // genCertAndKubeconfig signs the certificate/key and generates the kubeconfig for the tenant;
 // the generated kubeconfig will be attached in the tenant's annotation.
-func genCertAndKubeconfig(tenantCli tenantclient.TenantV1alpha1Interface, tenantId string, tenantlister tenantlister.TenantLister, clientCAFile, clientCAKeyFile, kubeZooHostAddress string) error {
+func genCertAndKubeconfig(tenantCli tenantclient.TenantV1alpha1Interface, tenantId string, tenantlister tenantlister.TenantLister, clientCAFile, clientCAKeyFile, kubeZooHostAddress string, validity, validityCeiling time.Duration) error {
 	cached, err := tenantlister.Get(tenantId)
 	if err != nil {
 		return errors.Errorf("Error fetching object with key %s from store: %v", tenantId, err)
@@ -1045,7 +1057,8 @@ func genCertAndKubeconfig(tenantCli tenantclient.TenantV1alpha1Interface, tenant
 	}
 
 	// 2. Generate the certificate and the key
-	cert, key, err := util.NewTenantCertAndKey(clientCAFile, clientCAKeyFile, tenantId)
+	cert, key, err := util.NewTenantCertAndKey(clientCAFile, clientCAKeyFile, tenantId,
+		credentialValidityFor(tenant, validity, validityCeiling))
 	if err != nil {
 		klog.Warningf("fail to generate the certificate for the tenant(%s): %v", tenantId, err)
 		return err
@@ -1074,12 +1087,46 @@ func genCertAndKubeconfig(tenantCli tenantclient.TenantV1alpha1Interface, tenant
 	// issued -- and a controller restart inside that window reads it as "never
 	// issued" and signs another one.
 	tenant.Annotations[util.AnnotationTenantCredentialIssuedAt] = time.Now().UTC().Format(time.RFC3339)
+	// ⭐ Expiry is written down because otherwise nobody can see it. The
+	// certificate carries it, but reading it means base64-decoding an annotation
+	// and running openssl on the result -- so in practice the first anyone learns
+	// of an expired credential is a 401 from CI on a morning nobody chose. The
+	// whole point of a shorter validity is that expiry becomes a routine event,
+	// and a routine event has to be visible before it happens.
+	tenant.Annotations[util.AnnotationTenantCredentialExpiresAt] = cert.NotAfter.UTC().Format(time.RFC3339)
 	if _, err := tenantCli.Tenants().Update(context.TODO(), tenant, metav1.UpdateOptions{}); err != nil {
 		klog.Warningf("fail to update the tenant with new annotation(%s): %v", util.AnnotationTenantKubeConfigBase64, err)
 		return err
 	}
 	klog.V(4).Infof("kubeconfig of tenant(%s) is created", tenantId)
 	return nil
+}
+
+// credentialValidityFor resolves how long this tenant's next credential lives:
+// the tenant's own choice, bounded by the platform's ceiling.
+//
+// ⭐ Both halves are decisions by different parties and neither can be dropped.
+// How often a tenant wants to come back for a credential depends on how its CI
+// is wired and how many people hold a kubeconfig -- the platform cannot answer
+// that. How long the platform is willing to be unable to cut that tenant off is
+// not the tenant's to answer either, because a client certificate cannot be
+// revoked and the validity is the whole bound.
+//
+// ⚠️ A request over the ceiling is CLAMPED, not refused. Refusing would put a
+// tenant into a state where it has no working credential and cannot get one
+// without an operator noticing an error it never sees, over a field it is
+// allowed to set. The clamp is logged so the operator can see the disagreement.
+func credentialValidityFor(tenant *tenantv1alpha1.Tenant, platformDefault, ceiling time.Duration) time.Duration {
+	validity := platformDefault
+	if tenant.Spec.CredentialValidity != nil && tenant.Spec.CredentialValidity.Duration > 0 {
+		validity = tenant.Spec.CredentialValidity.Duration
+	}
+	if ceiling > 0 && validity > ceiling {
+		klog.Infof("tenant(%s) asked for a credential valid %s, which is beyond the platform ceiling of %s; issuing %s",
+			tenant.Name, validity, ceiling, ceiling)
+		validity = ceiling
+	}
+	return validity
 }
 
 // stampCredentialIssued records an issue time against a credential that already

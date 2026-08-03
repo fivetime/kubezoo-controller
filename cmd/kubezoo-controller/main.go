@@ -66,6 +66,10 @@ type options struct {
 	// credentialRetention is how long the platform keeps its copy of a tenant's
 	// kubeconfig -- and therefore of the tenant's private key -- after issuing it.
 	credentialRetention time.Duration
+	// credentialValidity is what a tenant gets when it asks for nothing;
+	// credentialValidityCeiling is the longest request that will be honoured.
+	credentialValidity        time.Duration
+	credentialValidityCeiling time.Duration
 }
 
 func (o *options) addFlags(fs *flag.FlagSet) {
@@ -92,6 +96,16 @@ func (o *options) addFlags(fs *flag.FlagSet) {
 			"leverage. Removing the credential-issued-at annotation asks for a new credential. "+
 			"Zero or less keeps the copy indefinitely, for a provisioning flow that collects it "+
 			"later than any window would allow.")
+	fs.DurationVar(&o.credentialValidity, "tenant-credential-validity", 90*24*time.Hour,
+		"How long a tenant credential is valid when the tenant asks for nothing. A tenant can "+
+			"choose its own with spec.credentialValidity. This number is the platform's only "+
+			"bound on how long a credential keeps working after the platform would rather it "+
+			"stopped, because a client certificate cannot be revoked -- so it is also how long "+
+			"cutting off a single tenant takes.")
+	fs.DurationVar(&o.credentialValidityCeiling, "max-tenant-credential-validity", 365*24*time.Hour,
+		"Longest spec.credentialValidity that will be honoured. A longer request is clamped to "+
+			"this and logged, rather than refused: refusing would leave a tenant with no working "+
+			"credential over a field it is allowed to set. Zero or less means no ceiling.")
 }
 
 func main() {
@@ -149,7 +163,9 @@ func main() {
 		o.clientCAKeyFile,
 		o.kubezooAddress,
 		o.kubezooPort,
-		o.credentialRetention)
+		o.credentialRetention,
+		o.credentialValidity,
+		o.credentialValidityCeiling)
 
 	// No Start here. controller.Run runs the informer it is handed -- that is its
 	// contract -- and calling Start as well produced client-go's "the

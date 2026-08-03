@@ -158,3 +158,81 @@ func TestWithdrawCollectedCredential(t *testing.T) {
 		})
 	}
 }
+
+// TestCredentialValidityFor pins who decides how long a tenant credential lives.
+//
+// ⭐ Two decisions by two parties, and neither can be dropped. How often a
+// tenant wants to come back for a credential depends on its own operations --
+// its CI, how many people hold a kubeconfig, its own policy -- and the platform
+// cannot answer that. How long the platform is willing to be unable to cut a
+// tenant off is not the tenant's to answer either: a client certificate cannot
+// be revoked, so the validity is the entire bound.
+//
+// ⚠️ Over the ceiling is CLAMPED, not refused. A refusal would leave a tenant
+// with no working credential, and no way to get one, over a field it is allowed
+// to set -- and the error would go to a controller log rather than to the person
+// who set it.
+func TestCredentialValidityFor(t *testing.T) {
+	day := 24 * time.Hour
+	asked := func(d time.Duration) *tenantv1alpha1.Tenant {
+		return &tenantv1alpha1.Tenant{
+			ObjectMeta: metav1.ObjectMeta{Name: "909090"},
+			Spec:       tenantv1alpha1.TenantSpec{CredentialValidity: &metav1.Duration{Duration: d}},
+		}
+	}
+
+	for _, tc := range []struct {
+		name     string
+		tenant   *tenantv1alpha1.Tenant
+		fallback time.Duration
+		ceiling  time.Duration
+		want     time.Duration
+	}{
+		{
+			name:     "asks for nothing",
+			tenant:   &tenantv1alpha1.Tenant{ObjectMeta: metav1.ObjectMeta{Name: "909090"}},
+			fallback: 90 * day, ceiling: 365 * day, want: 90 * day,
+		},
+		{
+			name:   "asks for shorter than the default",
+			tenant: asked(7 * day),
+			// ⭐ Honoured without argument. A tenant wanting to come back more
+			// often is never a problem for the platform.
+			fallback: 90 * day, ceiling: 365 * day, want: 7 * day,
+		},
+		{
+			name:     "asks for longer than the default but under the ceiling",
+			tenant:   asked(180 * day),
+			fallback: 90 * day, ceiling: 365 * day, want: 180 * day,
+		},
+		{
+			name:     "asks for more than the ceiling",
+			tenant:   asked(10 * 365 * day),
+			fallback: 90 * day, ceiling: 365 * day, want: 365 * day,
+		},
+		{
+			name:     "no ceiling configured",
+			tenant:   asked(10 * 365 * day),
+			fallback: 90 * day, ceiling: 0, want: 10 * 365 * day,
+		},
+		{
+			// A zero or negative request is not a request. Treating it as one
+			// would mean a tenant could ask for a credential that has already
+			// expired.
+			name:     "asks for zero",
+			tenant:   asked(0),
+			fallback: 90 * day, ceiling: 365 * day, want: 90 * day,
+		},
+		{
+			name:     "asks for a negative duration",
+			tenant:   asked(-time.Hour),
+			fallback: 90 * day, ceiling: 365 * day, want: 90 * day,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := credentialValidityFor(tc.tenant, tc.fallback, tc.ceiling); got != tc.want {
+				t.Errorf("credentialValidityFor = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
