@@ -111,10 +111,13 @@ type TenantController struct {
 	clientCAFile       string
 	clientCAKeyFile    string
 	kubeZooHostAddress string
+	// credentialRetention is how long the platform keeps its copy of a tenant's
+	// kubeconfig -- and so of the tenant's private key -- after issuing it.
+	credentialRetention time.Duration
 }
 
 // newTenantController create a controller to handler the events of tenant.
-func newTenantController(ti cache.SharedIndexInformer, tenantCli tenantclient.TenantV1alpha1Interface, coreCli v1.CoreV1Interface, rbacCli rbacclient.RbacV1Interface, quotaClient quotaclient.QuotaV1alpha1Interface, discoveryCli *discovery.DiscoveryClient, dynamicCli dynamic.Interface, crdClient apiextensions.Interface, clientCAFile, clientCAKeyFile, kubeZooBindAddress string, kubeZooSecurePort int) *TenantController {
+func newTenantController(ti cache.SharedIndexInformer, tenantCli tenantclient.TenantV1alpha1Interface, coreCli v1.CoreV1Interface, rbacCli rbacclient.RbacV1Interface, quotaClient quotaclient.QuotaV1alpha1Interface, discoveryCli *discovery.DiscoveryClient, dynamicCli dynamic.Interface, crdClient apiextensions.Interface, clientCAFile, clientCAKeyFile, kubeZooBindAddress string, kubeZooSecurePort int, credentialRetention time.Duration) *TenantController {
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 	// Each handler builds its own event. They used to share one Event value and
 	// one err declared out here, mutating it field by field before queueing it:
@@ -162,12 +165,13 @@ func newTenantController(ti cache.SharedIndexInformer, tenantCli tenantclient.Te
 		clientCAFile:            clientCAFile,
 		clientCAKeyFile:         clientCAKeyFile,
 		kubeZooHostAddress:      net.JoinHostPort(kubeZooBindAddress, strconv.Itoa(kubeZooSecurePort)),
+		credentialRetention:     credentialRetention,
 	}
 }
 
 // Run starts the tenant controller
-func Run(stopCh <-chan struct{}, ti cache.SharedIndexInformer, tenantCli tenantclient.TenantV1alpha1Interface, typedCli kubernetes.Interface, discoveryCli *discovery.DiscoveryClient, dynamicCli dynamic.Interface, crdClient apiextensions.Interface, quotaClient quotaclient.QuotaV1alpha1Interface, clientCAFile, clientCAKeyFile, kubeZooBindAddress string, kubeZooSecurePort int) {
-	tc := newTenantController(ti, tenantCli, typedCli.CoreV1(), typedCli.RbacV1(), quotaClient, discoveryCli, dynamicCli, crdClient, clientCAFile, clientCAKeyFile, kubeZooBindAddress, kubeZooSecurePort)
+func Run(stopCh <-chan struct{}, ti cache.SharedIndexInformer, tenantCli tenantclient.TenantV1alpha1Interface, typedCli kubernetes.Interface, discoveryCli *discovery.DiscoveryClient, dynamicCli dynamic.Interface, crdClient apiextensions.Interface, quotaClient quotaclient.QuotaV1alpha1Interface, clientCAFile, clientCAKeyFile, kubeZooBindAddress string, kubeZooSecurePort int, credentialRetention time.Duration) {
+	tc := newTenantController(ti, tenantCli, typedCli.CoreV1(), typedCli.RbacV1(), quotaClient, discoveryCli, dynamicCli, crdClient, clientCAFile, clientCAKeyFile, kubeZooBindAddress, kubeZooSecurePort, credentialRetention)
 	defer utilruntime.HandleCrash()
 	defer tc.queue.ShutDown()
 
@@ -751,6 +755,18 @@ func (tc *TenantController) syncResources(tenantId string) error {
 	if err := genCertAndKubeconfig(tc.tenantClient, tenantId, tc.tenantLister, tc.clientCAFile, tc.clientCAKeyFile, tc.kubeZooHostAddress); err != nil {
 		return err
 	}
+	// ⚠️ After issuing, not instead of it, and on every reconcile rather than on a
+	// timer of its own. The resync is what makes the retention window take effect
+	// at all: nothing else revisits a tenant that has stopped changing, and a
+	// tenant that has stopped changing is exactly the one whose credential has
+	// been sitting there longest.
+	current, err := tc.tenantLister.Get(tenantId)
+	if err != nil {
+		return errors.Errorf("Error fetching object with key %s from store: %v", tenantId, err)
+	}
+	if err := withdrawCollectedCredential(tc.tenantClient, current, tc.credentialRetention, time.Now()); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1001,9 +1017,31 @@ func genCertAndKubeconfig(tenantCli tenantclient.TenantV1alpha1Interface, tenant
 	// or a controller restart cleared the poisoned entry. A persistent rejection
 	// turned into a permanently green reconcile.
 	tenant := cached.DeepCopy()
-	// 1. return if Kubeconfig is already generated
-	if len(tenant.Annotations) != 0 && tenant.Annotations[util.AnnotationTenantKubeConfigBase64] != "" {
+
+	// 1. Decide from the two annotations which of the three states this is.
+	//
+	// ⭐ "Does it already have a kubeconfig" is no longer the question, because
+	// the kubeconfig is meant to go away: the platform hands it over once and
+	// then stops holding the tenant's private key. The question is whether a
+	// credential has ever been issued, and the issued-at marker is what answers
+	// it.
+	kubeconfig := tenant.Annotations[util.AnnotationTenantKubeConfigBase64]
+	issuedAt := tenant.Annotations[util.AnnotationTenantCredentialIssuedAt]
+	switch {
+	case issuedAt != "":
+		// Issued: either still being collected, or already withdrawn. Neither is
+		// a reason to sign something new. Asking for a new credential means
+		// removing this annotation.
 		return nil
+	case kubeconfig != "":
+		// ⚠️ Adoption, not reissue. A tenant provisioned before this marker
+		// existed has a kubeconfig and no marker, which reads as "never issued"
+		// -- and signing a second credential for every existing tenant would be
+		// a surprising thing for an upgrade to do on its own. Stamp the marker
+		// on what is already there and leave the credential alone. The retention
+		// clock then starts at the upgrade, which is the earliest moment the
+		// platform can honestly claim to know anything about it.
+		return stampCredentialIssued(tenantCli, tenant, time.Now())
 	}
 
 	// 2. Generate the certificate and the key
@@ -1031,10 +1069,87 @@ func genCertAndKubeconfig(tenantCli tenantclient.TenantV1alpha1Interface, tenant
 		tenant.Annotations = make(map[string]string)
 	}
 	tenant.Annotations[util.AnnotationTenantKubeConfigBase64] = kbcfgB64Str
+	// ⚠️ Written in the SAME update as the kubeconfig, deliberately. Two updates
+	// would leave a window where a credential exists with no record that it was
+	// issued -- and a controller restart inside that window reads it as "never
+	// issued" and signs another one.
+	tenant.Annotations[util.AnnotationTenantCredentialIssuedAt] = time.Now().UTC().Format(time.RFC3339)
 	if _, err := tenantCli.Tenants().Update(context.TODO(), tenant, metav1.UpdateOptions{}); err != nil {
 		klog.Warningf("fail to update the tenant with new annotation(%s): %v", util.AnnotationTenantKubeConfigBase64, err)
 		return err
 	}
 	klog.V(4).Infof("kubeconfig of tenant(%s) is created", tenantId)
+	return nil
+}
+
+// stampCredentialIssued records an issue time against a credential that already
+// exists, without touching the credential.
+func stampCredentialIssued(tenantCli tenantclient.TenantV1alpha1Interface, tenant *tenantv1alpha1.Tenant, at time.Time) error {
+	if tenant.Annotations == nil {
+		tenant.Annotations = make(map[string]string)
+	}
+	tenant.Annotations[util.AnnotationTenantCredentialIssuedAt] = at.UTC().Format(time.RFC3339)
+	if _, err := tenantCli.Tenants().Update(context.TODO(), tenant, metav1.UpdateOptions{}); err != nil {
+		klog.Warningf("fail to record the credential issue time for tenant(%s): %v", tenant.Name, err)
+		return err
+	}
+	klog.V(4).Infof("adopted the pre-existing credential of tenant(%s); its retention starts now", tenant.Name)
+	return nil
+}
+
+// withdrawCollectedCredential drops the tenant's kubeconfig -- and with it the
+// tenant's private key -- once it has had long enough to be collected.
+//
+// ⛔ The platform was never asked to keep it. A tenant wants a credential handed
+// over; it does not want a copy of its private key stored indefinitely on a
+// cluster-scoped object, where a single read is every tenant at once. Holding it
+// buys the platform nothing it can use: there is no revocation for a client
+// certificate, so the copy is not leverage, only exposure.
+//
+// ⚠️ Withdrawal is not revocation and must not be mistaken for it. The
+// certificate that was handed over stays valid until it expires; what stops
+// working here is the platform's ability to hand out that same credential again.
+// Cutting off a tenant that already holds one is a suspension (spec.suspension),
+// not this.
+//
+// retention <= 0 turns this off, for a platform whose provisioning flow collects
+// the credential later than any window would allow.
+func withdrawCollectedCredential(tenantCli tenantclient.TenantV1alpha1Interface, tenant *tenantv1alpha1.Tenant, retention time.Duration, now time.Time) error {
+	if retention <= 0 {
+		return nil
+	}
+	if tenant.Annotations[util.AnnotationTenantKubeConfigBase64] == "" {
+		return nil
+	}
+	issuedAt := tenant.Annotations[util.AnnotationTenantCredentialIssuedAt]
+	if issuedAt == "" {
+		// Not yet adopted; genCertAndKubeconfig stamps it and the clock starts
+		// there. Withdrawing without a recorded issue time would mean withdrawing
+		// on a clock nobody can see.
+		return nil
+	}
+	at, err := time.Parse(time.RFC3339, issuedAt)
+	if err != nil {
+		// ⚠️ Left alone rather than treated as expired. An unparseable timestamp
+		// is a bug or a hand edit, and destroying a credential on the strength of
+		// one would be the worst available reading of it.
+		klog.Warningf("tenant(%s) has an unparseable %s (%q); leaving its credential in place",
+			tenant.Name, util.AnnotationTenantCredentialIssuedAt, issuedAt)
+		return nil
+	}
+	if now.Before(at.Add(retention)) {
+		return nil
+	}
+	updated := tenant.DeepCopy()
+	delete(updated.Annotations, util.AnnotationTenantKubeConfigBase64)
+	if _, err := tenantCli.Tenants().Update(context.TODO(), updated, metav1.UpdateOptions{}); err != nil {
+		klog.Warningf("fail to withdraw the stored credential of tenant(%s): %v", tenant.Name, err)
+		return err
+	}
+	// Info, not V(4): an operator who goes looking for a kubeconfig that is no
+	// longer there needs to find out why without turning verbosity up.
+	klog.Infof("tenant(%s) credential issued at %s has been held for %s; dropping the stored copy. "+
+		"To be issued a new one, remove the %s annotation",
+		tenant.Name, issuedAt, retention, util.AnnotationTenantCredentialIssuedAt)
 	return nil
 }

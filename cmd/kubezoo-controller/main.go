@@ -63,6 +63,9 @@ type options struct {
 	kubezooPort     int
 
 	resyncPeriod time.Duration
+	// credentialRetention is how long the platform keeps its copy of a tenant's
+	// kubeconfig -- and therefore of the tenant's private key -- after issuing it.
+	credentialRetention time.Duration
 }
 
 func (o *options) addFlags(fs *flag.FlagSet) {
@@ -81,6 +84,14 @@ func (o *options) addFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&o.resyncPeriod, "resync-period", 5*time.Minute,
 		"How often to reconcile every tenant regardless of events. This is the repair path; "+
 			"ordinary changes are picked up by informers within seconds.")
+	fs.DurationVar(&o.credentialRetention, "credential-retention", 24*time.Hour,
+		"How long a freshly issued tenant kubeconfig is kept on the Tenant object before the "+
+			"stored copy is dropped. That copy contains the tenant's PRIVATE KEY, so keeping it "+
+			"forever makes one read of one object worth every tenant's credentials -- and it buys "+
+			"nothing, since a client certificate cannot be revoked and the copy is therefore not "+
+			"leverage. Removing the credential-issued-at annotation asks for a new credential. "+
+			"Zero or less keeps the copy indefinitely, for a provisioning flow that collects it "+
+			"later than any window would allow.")
 }
 
 func main() {
@@ -137,7 +148,8 @@ func main() {
 		o.clientCAFile,
 		o.clientCAKeyFile,
 		o.kubezooAddress,
-		o.kubezooPort)
+		o.kubezooPort,
+		o.credentialRetention)
 
 	// No Start here. controller.Run runs the informer it is handed -- that is its
 	// contract -- and calling Start as well produced client-go's "the

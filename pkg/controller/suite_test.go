@@ -150,6 +150,9 @@ var _ = BeforeSuite(func() {
 			clientCAKey,
 			host,
 			portInt,
+			// 0: the envtest suite asserts on the kubeconfig annotation, and a
+			// retention window would race it away mid-test.
+			0,
 		)
 	}()
 }, 60)
