@@ -107,6 +107,23 @@ func (tc *TenantController) syncClusterWideBindings(tenantID string,
 				tenantID, name, err)
 		}
 	}
+	// ⭐ The other half, and a different rule set entirely. Above is what a
+	// tenant may hold over its OWN api groups, safe because those groups contain
+	// nothing of anybody else's. This is what it may READ of the NATIVE
+	// cluster-scoped resources -- webhook configurations, CRDs -- where there is
+	// no such guarantee and confinement comes from kubezoo filtering every
+	// cluster-scoped read by name prefix.
+	//
+	// ⛔ Which is why it is granted to a group naming ONE ServiceAccount, and to
+	// a group kubezoo asserts rather than to the account itself: reaching
+	// upstream by any other route carries nothing at all.
+	for i := range records.Items {
+		record := &records.Items[i]
+		if err := tc.deriveServiceAccountReads(ctx, rbacClient, tenantID, record, wanted); err != nil {
+			klog.Warningf("tenant %s: could not derive the ServiceAccount reads of %s: %v",
+				tenantID, record.Name, err)
+		}
+	}
 	return tc.withdrawUnwantedPairs(ctx, rbacClient, tenantID, wanted)
 }
 
@@ -131,6 +148,66 @@ func (tc *TenantController) safeRulesFor(ctx context.Context, rbacClient rbaccli
 		return nil, err
 	}
 	return util.RulesSafeForClusterWideBinding(role.Rules, tenantID), nil
+}
+
+// deriveServiceAccountReads gives each ServiceAccount a record binds the
+// cluster-scoped READS its role asks for, as much of them as the tenant may have.
+//
+// ⚠️ One pair per ServiceAccount, not one per record. A record can name several
+// subjects, and they are not interchangeable -- a tenant splits work across
+// ServiceAccounts precisely to give them different reach.
+//
+// ⚠️ Users and Groups among the subjects are skipped. A tenant's only upstream
+// identities are its ServiceAccounts and its own credential; the credential
+// already holds these reads, and a bare user or group name would be a request
+// for an identity kubezoo does not mint.
+func (tc *TenantController) deriveServiceAccountReads(ctx context.Context,
+	rbacClient rbacclient.RbacV1Interface, tenantID string, record *rbacv1.RoleBinding,
+	wanted map[string]bool) error {
+
+	if record.RoleRef.Kind != "ClusterRole" {
+		return nil
+	}
+	role, err := rbacClient.ClusterRoles().Get(ctx, record.RoleRef.Name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	// What this tenant is allowed to hold at cluster scope at all. The
+	// intersection with it is the half that stops a tenant writing itself a
+	// wider ClusterRole and collecting the difference through a workload.
+	allowed := common.ClusterScopedRules()
+	for i := range record.Subjects {
+		subject := &record.Subjects[i]
+		if subject.Kind != rbacv1.ServiceAccountKind {
+			continue
+		}
+		// ⚠️ The subject's namespace is the tenant's own name for it; the group
+		// kubezoo asserts is built from the same, so the two must agree.
+		rules := util.ClusterScopedRulesForSA(role.Rules, allowed)
+		if len(rules) == 0 {
+			continue
+		}
+		name := derivedSAName(tenantID, subject.Namespace, subject.Name)
+		wanted[name] = true
+		group := util.TenantSAGroup(tenantID, subject.Namespace, subject.Name)
+		if err := applyDerivedPair(ctx, rbacClient, name, rules, []rbacv1.Subject{{
+			Kind:     rbacv1.GroupKind,
+			APIGroup: rbacv1.GroupName,
+			Name:     group,
+		}}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// derivedSAName names the pair derived for one ServiceAccount.
+//
+// ⚠️ Under the same prefix as the record-derived pairs, so that
+// withdrawUnwantedPairs finds and removes both by the same rule -- and so that
+// a ServiceAccount no longer named by any record loses its grant.
+func derivedSAName(tenantID, namespace, name string) string {
+	return derivedPrefix + tenantID + ":sa:" + namespace + ":" + name
 }
 
 // applyDerivedPair writes the restricted ClusterRole and the binding to it.
