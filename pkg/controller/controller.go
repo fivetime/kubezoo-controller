@@ -755,6 +755,18 @@ func (tc *TenantController) syncResources(tenantId string) error {
 	if err := syncNamespaceRoleBindings(tc.upstreamCoreClient, tc.upstreamRbacClient, tenantId, mode); err != nil {
 		return err
 	}
+	// ⚠️ Skipped entirely while a tenant is suspended. A suspension withdraws
+	// upstream permission; deriving a cluster-wide grant during one would hand
+	// back, through another door, exactly what the suspension took away.
+	if mode == "" {
+		if err := tc.syncClusterWideBindings(tenantId, tc.upstreamCoreClient, tc.upstreamRbacClient); err != nil {
+			klog.Warningf("tenant %s: could not reconcile its cluster-wide bindings: %v", tenantId, err)
+		}
+	} else if err := tc.withdrawUnwantedPairs(context.TODO(), tc.upstreamRbacClient, tenantId,
+		map[string]bool{}); err != nil {
+		klog.Warningf("tenant %s: could not withdraw its cluster-wide bindings for the suspension: %v",
+			tenantId, err)
+	}
 	if isFreeze(mode) {
 		tc.reportBindingsFreezingDoesNotReach(tenantId)
 	}
