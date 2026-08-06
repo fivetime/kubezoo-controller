@@ -29,3 +29,13 @@ test-integration: envtest
 
 .PHONY: test
 test: test-unit test-integration
+
+IMAGE_REPO ?= ghcr.io/fivetime
+IMAGE_TAG ?= $(shell git describe --tags --always --dirty)
+TARGET_PLATFORMS ?= linux/amd64
+
+.PHONY: docker-build
+docker-build:
+	@docker buildx build --load --platform $(TARGET_PLATFORMS) \
+		-f build/kubezoo-controller.Dockerfile \
+		-t $(IMAGE_REPO)/kubezoo-controller:$(IMAGE_TAG) .

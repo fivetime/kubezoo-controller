@@ -120,7 +120,12 @@ spec:
       serviceAccountName: kubezoo-controller
       containers:
         - name: kubezoo-controller
-          image: kubezoo/kubezoo-controller:local-up
+          # ⚠️ This pointed at kubezoo/kubezoo-controller:local-up, which does not
+          # exist -- not built here, and not on Docker Hub ("object not found").
+          # Nothing in the split ever built this image, so applying this manifest
+          # produced an ImagePullBackOff and, from the outside, a kubezoo that
+          # accepts Tenant objects and reconciles none of them.
+          image: ghcr.io/fivetime/kubezoo-controller:latest
           imagePullPolicy: IfNotPresent
           args:
             # Tenant 对象在 kubezoo 里,不在上游集群里。

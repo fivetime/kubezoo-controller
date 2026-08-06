@@ -1,0 +1,85 @@
+# ⛔ This file did not exist until after the three-way split, and its absence was
+# not visible. kubezoo-controller has a cmd/, and config/setup/controller.yaml
+# deploys it -- but nothing built the image. `kubezoo/kubezoo-controller` was not
+# on Docker Hub at all ("object not found"), so `make local-up` applied a
+# Deployment whose image existed nowhere.
+#
+# ⚠️ The shape is worth remembering: local_up.sh DOES warn when this repository
+# is missing, and that warning could never fire here -- the manifest was present,
+# only the image was not. The guard covered the case someone thought of.
+name: Build & Push images
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  attestations: write
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  images:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - bin: kubezoo-controller
+            image: kubezoo-controller
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: build/${{ matrix.bin }}.Dockerfile
+          # A pull request does not push, so the second architecture is built and
+          # then thrown away -- it roughly doubles the job for nothing.
+          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.bin }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.bin }}
+          provenance: mode=max
+          sbom: true
+      - name: Attest published image
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@v4
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
