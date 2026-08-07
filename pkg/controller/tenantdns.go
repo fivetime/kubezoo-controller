@@ -22,11 +22,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -64,6 +66,12 @@ const (
 	// tenantDNSSpecHashAnnotation records the spec this controller asked for,
 	// so a change to it reaches tenants that already have a resolver.
 	tenantDNSSpecHashAnnotation = "kubezoo.io/spec-hash"
+
+	// tenantKubernetesServicePort is what the tenant's own kubernetes Service
+	// reports. 443 rather than kubezoo's configured port because a client that
+	// resolves kubernetes.default.svc and dials https:// uses 443 -- so kubezoo's
+	// Service has to publish 443, and this has to agree with it.
+	tenantKubernetesServicePort = 443
 
 	tenantDNSPort     = 5353
 	tenantDNSReadyPrt = 8181
@@ -112,7 +120,128 @@ func (tc *TenantController) syncTenantDNS(tenantID string) error {
 	if err := tc.ensureTenantDNSService(tenantID); err != nil {
 		return err
 	}
-	return tc.ensureTenantDNSDeployment(tenantID)
+	if err := tc.ensureTenantDNSDeployment(tenantID); err != nil {
+		return err
+	}
+	return tc.ensureTenantKubernetesService(tenantID)
+}
+
+// ensureTenantKubernetesService gives the tenant a kubernetes Service of its own
+// that points at kubezoo.
+//
+// ⭐ Without it, kubernetes.default.svc.cluster.local is NXDOMAIN once a tenant
+// is on its own resolver -- the tenant cannot see the platform's kubernetes
+// Service, so the resolver has nothing to build that record from. Failing closed
+// is the safe direction, but it is still a regression: nearly everything written
+// to run in a cluster reaches for that name.
+//
+// ⛔ Headless, with the endpoint written by hand. A ClusterIP would need the
+// datapath to program a route to an address in ANOTHER cluster, and on node
+// types that do not implement ClusterIP at all -- the serverless ones here --
+// nothing would carry it. A headless record hands the pod kubezoo's own address
+// and the pod connects to it directly, which works on both.
+//
+// ⚠️ The port. A headless Service does no proxying, so the number below decides
+// only what an SRV lookup reports; a client resolving kubernetes.default.svc and
+// dialling https:// uses 443 whatever this says. That is why kubezoo's own
+// Service must publish 443 alongside its 6443 -- and why this declares 443
+// rather than kubezoo's configured port, so the SRV record agrees with where
+// traffic actually goes.
+//
+// ⚠️ Not a substitute for the KUBERNETES_SERVICE_HOST injection. kubelet skips
+// env vars for headless Services, so a pod still gets that variable from the
+// platform's own kubernetes Service. DNS and the environment point at different
+// places until the policy layer sets the variable too.
+func (tc *TenantController) ensureTenantKubernetesService(tenantID string) error {
+	host, _, err := net.SplitHostPort(tc.kubeZooHostAddress)
+	if err != nil || net.ParseIP(host) == nil {
+		// An EndpointSlice address must be an IP. A DNS name for kubezoo is a
+		// legitimate configuration, it just cannot be expressed here.
+		klog.InfoS("skipping the tenant kubernetes Service: kubezoo's address is not an IP",
+			"tenant", tenantID, "address", tc.kubeZooHostAddress)
+		return nil
+	}
+
+	ctx := context.TODO()
+	ns := tenantID + "-default"
+	labels := map[string]string{
+		tenantDNSServiceLabelKey: "true",
+		tenantDNSTenantLabelKey:  tenantID,
+	}
+
+	// ⚠️ Repaired rather than left alone if it already exists. This one lives in
+	// a namespace the TENANT can write, unlike everything else here, so a tenant
+	// that deletes or edits it gets it back on the next pass. Its own doing and
+	// its own breakage either way, but converging costs nothing.
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "kubernetes", Namespace: ns, Labels: labels},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: corev1.ClusterIPNone,
+			Ports: []corev1.ServicePort{
+				{Name: "https", Port: tenantKubernetesServicePort, Protocol: corev1.ProtocolTCP},
+			},
+		},
+	}
+	existingSvc, err := tc.upstreamCoreClient.Services(ns).Get(ctx, "kubernetes", metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		if _, cerr := tc.upstreamCoreClient.Services(ns).Create(ctx, svc, metav1.CreateOptions{}); cerr != nil &&
+			!apierrors.IsAlreadyExists(cerr) {
+			return cerr
+		}
+	case err != nil:
+		return err
+	case existingSvc.Spec.ClusterIP != corev1.ClusterIPNone:
+		// A tenant replaced it with an ordinary Service. clusterIP is immutable,
+		// so the only repair is to replace the object.
+		if derr := tc.upstreamCoreClient.Services(ns).Delete(ctx, "kubernetes", metav1.DeleteOptions{}); derr != nil {
+			return derr
+		}
+		if _, cerr := tc.upstreamCoreClient.Services(ns).Create(ctx, svc, metav1.CreateOptions{}); cerr != nil &&
+			!apierrors.IsAlreadyExists(cerr) {
+			return cerr
+		}
+	}
+
+	slice := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubernetes-kubezoo",
+			Namespace: ns,
+			Labels: map[string]string{
+				discoveryv1.LabelServiceName: "kubernetes",
+				tenantDNSServiceLabelKey:     "true",
+				tenantDNSTenantLabelKey:      tenantID,
+			},
+		},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Ports: []discoveryv1.EndpointPort{{
+			Name:     ptr.To("https"),
+			Port:     ptr.To[int32](tenantKubernetesServicePort),
+			Protocol: ptr.To(corev1.ProtocolTCP),
+		}},
+		Endpoints: []discoveryv1.Endpoint{{
+			Addresses:  []string{host},
+			Conditions: discoveryv1.EndpointConditions{Ready: ptr.To(true)},
+		}},
+	}
+	existingSlice, err := tc.upstreamEndpointSliceClient.EndpointSlices(ns).Get(ctx, slice.Name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		_, cerr := tc.upstreamEndpointSliceClient.EndpointSlices(ns).Create(ctx, slice, metav1.CreateOptions{})
+		if apierrors.IsAlreadyExists(cerr) {
+			return nil
+		}
+		return cerr
+	}
+	if err != nil {
+		return err
+	}
+	if len(existingSlice.Endpoints) == 1 && len(existingSlice.Endpoints[0].Addresses) == 1 &&
+		existingSlice.Endpoints[0].Addresses[0] == host {
+		return nil
+	}
+	slice.ResourceVersion = existingSlice.ResourceVersion
+	_, err = tc.upstreamEndpointSliceClient.EndpointSlices(ns).Update(ctx, slice, metav1.UpdateOptions{})
+	return err
 }
 
 // deleteTenantDNS removes what syncTenantDNS made.

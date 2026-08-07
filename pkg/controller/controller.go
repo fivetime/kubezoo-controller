@@ -45,8 +45,9 @@ import (
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
-	v1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	appsclient "k8s.io/client-go/kubernetes/typed/apps/v1"
+	v1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	discoveryclient "k8s.io/client-go/kubernetes/typed/discovery/v1"
 	rbacclient "k8s.io/client-go/kubernetes/typed/rbac/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/retry"
@@ -125,10 +126,14 @@ type TenantController struct {
 	// without these leaves every tenant on the platform resolver -- the
 	// behaviour that came before tenantdns.go. See that file for why a tenant
 	// has its own resolver at all.
-	upstreamAppsClient     appsclient.AppsV1Interface
-	tenantDNSImage         string
-	tenantDNSReplicas      int32
-	tenantDNSClusterDomain string
+	upstreamAppsClient appsclient.AppsV1Interface
+	// upstreamEndpointSliceClient writes the endpoint behind the tenant's own
+	// kubernetes Service, whose target lives in another cluster and so is never
+	// discovered by any controller.
+	upstreamEndpointSliceClient discoveryclient.DiscoveryV1Interface
+	tenantDNSImage              string
+	tenantDNSReplicas           int32
+	tenantDNSClusterDomain      string
 }
 
 // TenantDNSOptions configures the per-tenant resolver.
@@ -152,7 +157,7 @@ type TenantDNSOptions struct {
 }
 
 // newTenantController create a controller to handler the events of tenant.
-func newTenantController(ti cache.SharedIndexInformer, tenantCli tenantclient.TenantV1alpha1Interface, coreCli v1.CoreV1Interface, rbacCli rbacclient.RbacV1Interface, appsCli appsclient.AppsV1Interface, quotaClient quotaclient.QuotaV1alpha1Interface, discoveryCli *discovery.DiscoveryClient, dynamicCli dynamic.Interface, crdClient apiextensions.Interface, clientCAFile, clientCAKeyFile, kubeZooBindAddress string, kubeZooSecurePort int, credentialRetention, credentialValidity, credentialValidityCeiling time.Duration, dnsOpts TenantDNSOptions) *TenantController {
+func newTenantController(ti cache.SharedIndexInformer, tenantCli tenantclient.TenantV1alpha1Interface, coreCli v1.CoreV1Interface, rbacCli rbacclient.RbacV1Interface, appsCli appsclient.AppsV1Interface, sliceCli discoveryclient.DiscoveryV1Interface, quotaClient quotaclient.QuotaV1alpha1Interface, discoveryCli *discovery.DiscoveryClient, dynamicCli dynamic.Interface, crdClient apiextensions.Interface, clientCAFile, clientCAKeyFile, kubeZooBindAddress string, kubeZooSecurePort int, credentialRetention, credentialValidity, credentialValidityCeiling time.Duration, dnsOpts TenantDNSOptions) *TenantController {
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 	// Each handler builds its own event. They used to share one Event value and
 	// one err declared out here, mutating it field by field before queueing it:
@@ -207,10 +212,11 @@ func newTenantController(ti cache.SharedIndexInformer, tenantCli tenantclient.Te
 		// ⚠️ appsCli is left nil when per-tenant DNS is off, and syncTenantDNS
 		// keys off exactly that. Storing the client but gating on a separate
 		// boolean would let the two disagree.
-		upstreamAppsClient:     appsClientIfEnabled(appsCli, dnsOpts),
-		tenantDNSImage:         dnsOpts.Image,
-		tenantDNSReplicas:      dnsOpts.Replicas,
-		tenantDNSClusterDomain: dnsOpts.ClusterDomain,
+		upstreamAppsClient:          appsClientIfEnabled(appsCli, dnsOpts),
+		upstreamEndpointSliceClient: sliceCli,
+		tenantDNSImage:              dnsOpts.Image,
+		tenantDNSReplicas:           dnsOpts.Replicas,
+		tenantDNSClusterDomain:      dnsOpts.ClusterDomain,
 	}
 }
 
@@ -223,7 +229,7 @@ func appsClientIfEnabled(appsCli appsclient.AppsV1Interface, o TenantDNSOptions)
 
 // Run starts the tenant controller
 func Run(stopCh <-chan struct{}, ti cache.SharedIndexInformer, tenantCli tenantclient.TenantV1alpha1Interface, typedCli kubernetes.Interface, discoveryCli *discovery.DiscoveryClient, dynamicCli dynamic.Interface, crdClient apiextensions.Interface, quotaClient quotaclient.QuotaV1alpha1Interface, clientCAFile, clientCAKeyFile, kubeZooBindAddress string, kubeZooSecurePort int, credentialRetention, credentialValidity, credentialValidityCeiling time.Duration, dnsOpts TenantDNSOptions) {
-	tc := newTenantController(ti, tenantCli, typedCli.CoreV1(), typedCli.RbacV1(), typedCli.AppsV1(), quotaClient, discoveryCli, dynamicCli, crdClient, clientCAFile, clientCAKeyFile, kubeZooBindAddress, kubeZooSecurePort, credentialRetention, credentialValidity, credentialValidityCeiling, dnsOpts)
+	tc := newTenantController(ti, tenantCli, typedCli.CoreV1(), typedCli.RbacV1(), typedCli.AppsV1(), typedCli.DiscoveryV1(), quotaClient, discoveryCli, dynamicCli, crdClient, clientCAFile, clientCAKeyFile, kubeZooBindAddress, kubeZooSecurePort, credentialRetention, credentialValidity, credentialValidityCeiling, dnsOpts)
 	defer utilruntime.HandleCrash()
 	defer tc.queue.ShutDown()
 

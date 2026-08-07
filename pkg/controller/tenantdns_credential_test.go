@@ -168,3 +168,92 @@ func TestEnsureTenantDNSCredentialRenewsWhenExpiring(t *testing.T) {
 			"from kubezoo and serves an ever-staler cache, with nothing in kubezoo reporting it")
 	}
 }
+
+// TestTenantKubernetesServiceIsHeadless -- the record has to hand the pod
+// kubezoo's own address.
+//
+// ⛔ A ClusterIP here would need the datapath to carry traffic to an address in
+// ANOTHER cluster, and the serverless nodes in this deployment do not implement
+// ClusterIP at all -- measured: a ClusterIP in the tenant cluster timed out from
+// such a pod while kubezoo's own address answered. A headless record works on
+// both kinds of node because nothing has to be programmed for it.
+func TestTenantKubernetesServiceIsHeadless(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	tc := &TenantController{
+		upstreamCoreClient:          client.CoreV1(),
+		upstreamEndpointSliceClient: client.DiscoveryV1(),
+		kubeZooHostAddress:          "10.224.18.51:6443",
+	}
+	if err := tc.ensureTenantKubernetesService("111111"); err != nil {
+		t.Fatalf("provisioning: %v", err)
+	}
+	svc, err := client.CoreV1().Services("111111-default").Get(context.TODO(), "kubernetes", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("the Service was not created: %v", err)
+	}
+	if svc.Spec.ClusterIP != "None" {
+		t.Errorf("clusterIP = %q, want None", svc.Spec.ClusterIP)
+	}
+	slice, err := client.DiscoveryV1().EndpointSlices("111111-default").Get(context.TODO(), "kubernetes-kubezoo", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("the EndpointSlice was not created: %v", err)
+	}
+	if len(slice.Endpoints) != 1 || len(slice.Endpoints[0].Addresses) != 1 ||
+		slice.Endpoints[0].Addresses[0] != "10.224.18.51" {
+		t.Errorf("endpoints = %+v, want the kubezoo address 10.224.18.51", slice.Endpoints)
+	}
+	if len(slice.Ports) != 1 || slice.Ports[0].Port == nil || *slice.Ports[0].Port != 443 {
+		t.Errorf("port = %+v, want 443 -- a client resolving kubernetes.default.svc and dialling "+
+			"https:// uses 443, so an SRV record saying anything else disagrees with reality",
+			slice.Ports)
+	}
+}
+
+// TestTenantKubernetesServiceIsRepaired -- this one lives in a namespace the
+// TENANT can write, unlike the rest of the resolver. A tenant that replaces it
+// with an ordinary Service must get the headless one back; clusterIP is
+// immutable, so the repair has to delete and recreate rather than update.
+func TestTenantKubernetesServiceIsRepaired(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	tc := &TenantController{
+		upstreamCoreClient:          client.CoreV1(),
+		upstreamEndpointSliceClient: client.DiscoveryV1(),
+		kubeZooHostAddress:          "10.224.18.51:6443",
+	}
+	if err := tc.ensureTenantKubernetesService("111111"); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+	hijacked, _ := client.CoreV1().Services("111111-default").Get(context.TODO(), "kubernetes", metav1.GetOptions{})
+	hijacked.Spec.ClusterIP = "254.51.9.9"
+	if _, err := client.CoreV1().Services("111111-default").Update(context.TODO(), hijacked, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("seeding a hijacked Service: %v", err)
+	}
+
+	if err := tc.ensureTenantKubernetesService("111111"); err != nil {
+		t.Fatalf("repair pass: %v", err)
+	}
+	repaired, _ := client.CoreV1().Services("111111-default").Get(context.TODO(), "kubernetes", metav1.GetOptions{})
+	if repaired.Spec.ClusterIP != "None" {
+		t.Errorf("clusterIP = %q after repair, want None; the tenant's own pods would keep "+
+			"resolving kubernetes.default.svc to an address nothing answers on",
+			repaired.Spec.ClusterIP)
+	}
+}
+
+// TestTenantKubernetesServiceSkippedForANonIPAddress -- an EndpointSlice address
+// must be an IP, and configuring kubezoo by DNS name is legitimate. Skipping
+// beats writing an invalid object that the apiserver refuses on every pass.
+func TestTenantKubernetesServiceSkippedForANonIPAddress(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	tc := &TenantController{
+		upstreamCoreClient:          client.CoreV1(),
+		upstreamEndpointSliceClient: client.DiscoveryV1(),
+		kubeZooHostAddress:          "kubezoo.example.com:6443",
+	}
+	if err := tc.ensureTenantKubernetesService("111111"); err != nil {
+		t.Fatalf("a non-IP address must be skipped, not fail the whole reconcile: %v", err)
+	}
+	if _, err := client.CoreV1().Services("111111-default").Get(context.TODO(), "kubernetes", metav1.GetOptions{}); err == nil {
+		t.Error("a Service was created whose EndpointSlice cannot be written")
+	}
+}
