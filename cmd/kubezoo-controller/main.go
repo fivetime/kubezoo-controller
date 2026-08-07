@@ -62,6 +62,12 @@ type options struct {
 	kubezooAddress  string
 	kubezooPort     int
 
+	// The per-tenant resolver. See pkg/controller/tenantdns.go.
+	tenantDNSEnabled       bool
+	tenantDNSImage         string
+	tenantDNSReplicas      int
+	tenantDNSClusterDomain string
+
 	resyncPeriod time.Duration
 	// credentialRetention is how long the platform keeps its copy of a tenant's
 	// kubeconfig -- and therefore of the tenant's private key -- after issuing it.
@@ -85,6 +91,20 @@ func (o *options) addFlags(fs *flag.FlagSet) {
 		"Address to write into the kubeconfig handed to each tenant.")
 	fs.IntVar(&o.kubezooPort, "kubezoo-port", 6443,
 		"Port to write into the kubeconfig handed to each tenant.")
+	fs.BoolVar(&o.tenantDNSEnabled, "tenant-dns", false,
+		"Give each tenant its own CoreDNS, reading Services back out of kubezoo with that "+
+			"tenant's credential, so the FQDNs its pods resolve are the ones the tenant can see. "+
+			"Off by default: the gateway must be configured to match, and until both sides are on, "+
+			"tenants keep the platform resolver.")
+	fs.StringVar(&o.tenantDNSImage, "tenant-dns-image", "registry.k8s.io/coredns/coredns:v1.13.1",
+		"CoreDNS image each tenant's resolver runs.")
+	fs.IntVar(&o.tenantDNSReplicas, "tenant-dns-replicas", 2,
+		"Replicas per tenant resolver. One means that tenant loses name resolution whenever "+
+			"its single pod is rescheduled.")
+	fs.StringVar(&o.tenantDNSClusterDomain, "tenant-dns-cluster-domain", "cluster.local",
+		"Zone the tenant resolvers are authoritative for. ⚠️ Must match the gateway's "+
+			"--tenant-dns-cluster-domain: they disagree silently, and the only symptom is that "+
+			"short names stop resolving.")
 	fs.DurationVar(&o.resyncPeriod, "resync-period", 5*time.Minute,
 		"How often to reconcile every tenant regardless of events. This is the repair path; "+
 			"ordinary changes are picked up by informers within seconds.")
@@ -165,7 +185,13 @@ func main() {
 		o.kubezooPort,
 		o.credentialRetention,
 		o.credentialValidity,
-		o.credentialValidityCeiling)
+		o.credentialValidityCeiling,
+		controller.TenantDNSOptions{
+			Enabled:       o.tenantDNSEnabled,
+			Image:         o.tenantDNSImage,
+			Replicas:      int32(o.tenantDNSReplicas),
+			ClusterDomain: o.tenantDNSClusterDomain,
+		})
 
 	// No Start here. controller.Run runs the informer it is handed -- that is its
 	// contract -- and calling Start as well produced client-go's "the

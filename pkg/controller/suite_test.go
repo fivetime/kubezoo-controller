@@ -154,6 +154,10 @@ var _ = BeforeSuite(func() {
 			// retention window would race it away mid-test.
 			0,
 			0, 0,
+			// Per-tenant DNS off: the envtest apiserver would happily create the
+			// Deployment, but nothing would run it, and a suite that provisions
+			// resolvers nobody schedules only slows itself down.
+			TenantDNSOptions{},
 		)
 	}()
 }, 60)

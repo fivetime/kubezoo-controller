@@ -46,6 +46,7 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	v1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	appsclient "k8s.io/client-go/kubernetes/typed/apps/v1"
 	rbacclient "k8s.io/client-go/kubernetes/typed/rbac/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/retry"
@@ -118,10 +119,40 @@ type TenantController struct {
 	// and credentialValidityCeiling is the longest one that will be honoured.
 	credentialValidity        time.Duration
 	credentialValidityCeiling time.Duration
+
+	// The per-tenant resolver. nil upstreamAppsClient disables it entirely, and
+	// the gateway fails open when a tenant has none, so a controller built
+	// without these leaves every tenant on the platform resolver -- the
+	// behaviour that came before tenantdns.go. See that file for why a tenant
+	// has its own resolver at all.
+	upstreamAppsClient     appsclient.AppsV1Interface
+	tenantDNSImage         string
+	tenantDNSReplicas      int32
+	tenantDNSClusterDomain string
+}
+
+// TenantDNSOptions configures the per-tenant resolver.
+//
+// A struct rather than four more positional parameters: newTenantController
+// already takes fifteen, and four more untyped strings and numbers in that list
+// is how the wrong value ends up in the wrong field without the compiler
+// noticing.
+type TenantDNSOptions struct {
+	// Enabled is what an operator turns off to go back to the platform resolver.
+	Enabled bool
+	// Image is the CoreDNS image each tenant's resolver runs.
+	Image string
+	// Replicas per tenant. One is a single point of failure for that tenant's
+	// name resolution; two is the price of not having one.
+	Replicas int32
+	// ClusterDomain must agree with the search suffixes the gateway writes into
+	// pods. They disagree silently -- short names simply stop resolving -- which
+	// is why both sides read it from the same flag.
+	ClusterDomain string
 }
 
 // newTenantController create a controller to handler the events of tenant.
-func newTenantController(ti cache.SharedIndexInformer, tenantCli tenantclient.TenantV1alpha1Interface, coreCli v1.CoreV1Interface, rbacCli rbacclient.RbacV1Interface, quotaClient quotaclient.QuotaV1alpha1Interface, discoveryCli *discovery.DiscoveryClient, dynamicCli dynamic.Interface, crdClient apiextensions.Interface, clientCAFile, clientCAKeyFile, kubeZooBindAddress string, kubeZooSecurePort int, credentialRetention, credentialValidity, credentialValidityCeiling time.Duration) *TenantController {
+func newTenantController(ti cache.SharedIndexInformer, tenantCli tenantclient.TenantV1alpha1Interface, coreCli v1.CoreV1Interface, rbacCli rbacclient.RbacV1Interface, appsCli appsclient.AppsV1Interface, quotaClient quotaclient.QuotaV1alpha1Interface, discoveryCli *discovery.DiscoveryClient, dynamicCli dynamic.Interface, crdClient apiextensions.Interface, clientCAFile, clientCAKeyFile, kubeZooBindAddress string, kubeZooSecurePort int, credentialRetention, credentialValidity, credentialValidityCeiling time.Duration, dnsOpts TenantDNSOptions) *TenantController {
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 	// Each handler builds its own event. They used to share one Event value and
 	// one err declared out here, mutating it field by field before queueing it:
@@ -172,12 +203,27 @@ func newTenantController(ti cache.SharedIndexInformer, tenantCli tenantclient.Te
 		credentialRetention:       credentialRetention,
 		credentialValidity:        credentialValidity,
 		credentialValidityCeiling: credentialValidityCeiling,
+
+		// ⚠️ appsCli is left nil when per-tenant DNS is off, and syncTenantDNS
+		// keys off exactly that. Storing the client but gating on a separate
+		// boolean would let the two disagree.
+		upstreamAppsClient:     appsClientIfEnabled(appsCli, dnsOpts),
+		tenantDNSImage:         dnsOpts.Image,
+		tenantDNSReplicas:      dnsOpts.Replicas,
+		tenantDNSClusterDomain: dnsOpts.ClusterDomain,
 	}
 }
 
+func appsClientIfEnabled(appsCli appsclient.AppsV1Interface, o TenantDNSOptions) appsclient.AppsV1Interface {
+	if !o.Enabled || o.Image == "" || o.ClusterDomain == "" {
+		return nil
+	}
+	return appsCli
+}
+
 // Run starts the tenant controller
-func Run(stopCh <-chan struct{}, ti cache.SharedIndexInformer, tenantCli tenantclient.TenantV1alpha1Interface, typedCli kubernetes.Interface, discoveryCli *discovery.DiscoveryClient, dynamicCli dynamic.Interface, crdClient apiextensions.Interface, quotaClient quotaclient.QuotaV1alpha1Interface, clientCAFile, clientCAKeyFile, kubeZooBindAddress string, kubeZooSecurePort int, credentialRetention, credentialValidity, credentialValidityCeiling time.Duration) {
-	tc := newTenantController(ti, tenantCli, typedCli.CoreV1(), typedCli.RbacV1(), quotaClient, discoveryCli, dynamicCli, crdClient, clientCAFile, clientCAKeyFile, kubeZooBindAddress, kubeZooSecurePort, credentialRetention, credentialValidity, credentialValidityCeiling)
+func Run(stopCh <-chan struct{}, ti cache.SharedIndexInformer, tenantCli tenantclient.TenantV1alpha1Interface, typedCli kubernetes.Interface, discoveryCli *discovery.DiscoveryClient, dynamicCli dynamic.Interface, crdClient apiextensions.Interface, quotaClient quotaclient.QuotaV1alpha1Interface, clientCAFile, clientCAKeyFile, kubeZooBindAddress string, kubeZooSecurePort int, credentialRetention, credentialValidity, credentialValidityCeiling time.Duration, dnsOpts TenantDNSOptions) {
+	tc := newTenantController(ti, tenantCli, typedCli.CoreV1(), typedCli.RbacV1(), typedCli.AppsV1(), quotaClient, discoveryCli, dynamicCli, crdClient, clientCAFile, clientCAKeyFile, kubeZooBindAddress, kubeZooSecurePort, credentialRetention, credentialValidity, credentialValidityCeiling, dnsOpts)
 	defer utilruntime.HandleCrash()
 	defer tc.queue.ShutDown()
 
@@ -506,6 +552,14 @@ func (tc *TenantController) deleteResources(tenantId string) error {
 		return errors.Errorf("fail to withdraw derived cluster bindings for tenant %s: %v", tenantId, err)
 	}
 
+	// ⚠️ Explicit, unlike everything the tenant's own namespaces hold. The
+	// resolver lives in a PLATFORM namespace, so deleting the tenant's namespaces
+	// does not collect it: a Deployment, a ClusterIP and a still-valid credential
+	// would outlive the tenant -- one set per tenant ever created.
+	if err := tc.deleteTenantDNS(tenantId); err != nil {
+		return errors.Errorf("fail to delete the resolver for tenant %s: %v", tenantId, err)
+	}
+
 	// Last, and deliberately so. The namespaces are terminating by now, which
 	// admits no new objects, and the tenant's cluster-scoped bindings are gone --
 	// so a finalizer cleared here cannot be put back.
@@ -754,6 +808,25 @@ func (tc *TenantController) syncResources(tenantId string) error {
 	}
 	if err := syncNamespaceRoleBindings(tc.upstreamCoreClient, tc.upstreamRbacClient, tenantId, mode); err != nil {
 		return err
+	}
+	// The tenant's own resolver, so that the names its pods resolve are the names
+	// it can see. tenantdns.go says why one shared CoreDNS cannot do it.
+	//
+	// ⚠️ Gated on the suspension for the same reason the cluster-wide bindings
+	// below are: the resolver holds a credential that reads the tenant's objects
+	// out of kubezoo, and reissuing one during a suspension hands back through
+	// another door what the suspension took away.
+	//
+	// ⛔ Note what this does NOT do: an already-provisioned resolver keeps
+	// running and keeps its credential when a tenant is suspended. Name
+	// resolution surviving a suspension is deliberate for the read-only mode --
+	// breaking DNS under a running workload produces symptoms nobody can trace
+	// back to a billing state -- but it means a full revocation still leaves a
+	// working reader of that tenant's objects until the tenant is deleted.
+	if mode == "" {
+		if err := tc.syncTenantDNS(tenantId); err != nil {
+			return err
+		}
 	}
 	// ⚠️ Skipped entirely while a tenant is suspended. A suspension withdraws
 	// upstream permission; deriving a cluster-wide grant during one would hand
