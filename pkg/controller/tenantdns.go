@@ -72,6 +72,18 @@ const (
 	// tenantDNSSpecHashAnnotation records the spec this controller asked for,
 	// so a change to it reaches tenants that already have a resolver.
 	tenantDNSSpecHashAnnotation = "kubezoo.io/spec-hash"
+	// tenantDNSSubjectAnnotation records WHICH identity a stored credential was
+	// issued for, and tenantDNSCredentialHashAnnotation carries a fingerprint of
+	// it onto the Deployment.
+	//
+	// ⛔ Both exist because reconciling on expiry alone converges on time and
+	// nothing else: when the identity changed from <tid>-admin to <tid>-dns,
+	// every tenant already holding a year-long credential kept the admin one,
+	// forever. The same shape as comparing only the image on the Deployment --
+	// a reconciler that watches a chosen subset stops converging the moment the
+	// interesting change falls outside it.
+	tenantDNSSubjectAnnotation        = "kubezoo.io/subject-cn"
+	tenantDNSCredentialHashAnnotation = "kubezoo.io/credential-hash"
 
 	// tenantKubernetesServicePort is what the tenant's own kubernetes Service
 	// reports. 443 rather than kubezoo's configured port because a client that
@@ -365,10 +377,12 @@ func (tc *TenantController) ensureTenantDNSCredential(tenantID string) error {
 	missing := apierrors.IsNotFound(err)
 	switch {
 	case err == nil:
-		if !tenantDNSCredentialNeedsRenewal(existing) {
+		if !tenantDNSCredentialNeedsRenewal(existing, tenantDNSUser(tenantID)) {
 			return nil
 		}
-		klog.InfoS("renewing the tenant resolver credential before it expires", "tenant", tenantID)
+		klog.InfoS("reissuing the tenant resolver credential", "tenant", tenantID,
+			"storedSubject", existing.Annotations[tenantDNSSubjectAnnotation],
+			"wantSubject", tenantDNSUser(tenantID))
 	case missing:
 	default:
 		return err
@@ -389,7 +403,8 @@ func (tc *TenantController) ensureTenantDNSCredential(tenantID string) error {
 			Annotations: map[string]string{
 				// Read back by tenantDNSCredentialNeedsRenewal rather than parsing
 				// the certificate on every pass.
-				"kubezoo.io/not-after": notAfter.UTC().Format(time.RFC3339),
+				"kubezoo.io/not-after":     notAfter.UTC().Format(time.RFC3339),
+				tenantDNSSubjectAnnotation: tenantDNSUser(tenantID),
 			},
 		},
 		Data: map[string][]byte{"kubeconfig": kubeconfig},
@@ -406,8 +421,14 @@ func (tc *TenantController) ensureTenantDNSCredential(tenantID string) error {
 	return err
 }
 
-func tenantDNSCredentialNeedsRenewal(secret *corev1.Secret) bool {
+func tenantDNSCredentialNeedsRenewal(secret *corev1.Secret, wantSubject string) bool {
 	if len(secret.Data["kubeconfig"]) == 0 {
+		return true
+	}
+	// ⛔ Checked before the expiry. A credential issued for a different identity
+	// is wrong however much life it has left -- and the one this replaced was
+	// the tenant's own administrator.
+	if secret.Annotations[tenantDNSSubjectAnnotation] != wantSubject {
 		return true
 	}
 	raw, ok := secret.Annotations["kubezoo.io/not-after"]
@@ -578,6 +599,19 @@ func (tc *TenantController) ensureTenantDNSDeployment(tenantID string) error {
 	ctx := context.TODO()
 	name := tenantDNSName(tenantID)
 	labels := map[string]string{tenantDNSTenantLabelKey: tenantID, "app": "kubezoo-tenant-dns"}
+
+	// ⛔ The credential's fingerprint rides on the POD TEMPLATE, so reissuing it
+	// rolls the pods. CoreDNS builds its client once at startup and never rereads
+	// the kubeconfig, so a rotated Secret lands in the mounted file and changes
+	// nothing: the resolver keeps presenting the old certificate until something
+	// restarts it. Without this, credential rotation is a no-op that looks like
+	// it worked right up to the day the old one expires.
+	credHash := ""
+	if sec, err := tc.upstreamCoreClient.Secrets(TenantDNSNamespace).Get(ctx, name, metav1.GetOptions{}); err == nil {
+		sum := sha256.Sum256(sec.Data["kubeconfig"])
+		credHash = hex.EncodeToString(sum[:8])
+	}
+
 	want := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -591,7 +625,10 @@ func (tc *TenantController) ensureTenantDNSDeployment(tenantID string) error {
 			Replicas: ptr.To[int32](tc.tenantDNSReplicas),
 			Selector: &metav1.LabelSelector{MatchLabels: labels},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				ObjectMeta: metav1.ObjectMeta{
+					Labels:      labels,
+					Annotations: map[string]string{tenantDNSCredentialHashAnnotation: credHash},
+				},
 				Spec: corev1.PodSpec{
 					// ⛔ Explicitly the platform's own DNS, not this pod's tenant.
 					// A resolver configured to resolve through itself cannot start:

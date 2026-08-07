@@ -71,7 +71,8 @@ func TestCredentialRenewal(t *testing.T) {
 	secretExpiring := func(in time.Duration) *corev1.Secret {
 		return &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
-				"kubezoo.io/not-after": time.Now().Add(in).UTC().Format(time.RFC3339),
+				"kubezoo.io/not-after":     time.Now().Add(in).UTC().Format(time.RFC3339),
+				tenantDNSSubjectAnnotation: "111111-dns",
 			}},
 			Data: map[string][]byte{"kubeconfig": []byte("x")},
 		}
@@ -88,12 +89,19 @@ func TestCredentialRenewal(t *testing.T) {
 		}}, true},
 		// ⚠️ An unannotated secret predates the renewal logic. Treating it as
 		// fine would leave exactly the silent expiry this guards against.
-		"no annotation":          {&corev1.Secret{Data: map[string][]byte{"kubeconfig": []byte("x")}}, true},
+		"no annotation": {&corev1.Secret{Data: map[string][]byte{"kubeconfig": []byte("x")}}, true},
+		// ⛔ The case that made this parameter necessary: a perfectly valid,
+		// year-long credential issued for the TENANT ADMIN. Renewing only on
+		// expiry left every existing tenant holding one.
+		"issued for the admin identity": {&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			"kubezoo.io/not-after":     time.Now().Add(300 * 24 * time.Hour).UTC().Format(time.RFC3339),
+			tenantDNSSubjectAnnotation: "111111-admin",
+		}}, Data: map[string][]byte{"kubeconfig": []byte("x")}}, true},
 		"unparseable annotation": {&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{"kubezoo.io/not-after": "soon"}}, Data: map[string][]byte{"kubeconfig": []byte("x")}}, true},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
-			if got := tenantDNSCredentialNeedsRenewal(c.secret); got != c.want {
+			if got := tenantDNSCredentialNeedsRenewal(c.secret, "111111-dns"); got != c.want {
 				t.Errorf("needsRenewal = %v, want %v", got, c.want)
 			}
 		})
