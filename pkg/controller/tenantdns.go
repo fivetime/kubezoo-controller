@@ -325,6 +325,19 @@ func (tc *TenantController) deleteTenantDNS(tenantID string) error {
 	record(tc.upstreamCoreClient.Services(TenantDNSNamespace).Delete(ctx, name, metav1.DeleteOptions{}))
 	record(tc.upstreamCoreClient.ConfigMaps(TenantDNSNamespace).Delete(ctx, name, metav1.DeleteOptions{}))
 	record(tc.upstreamCoreClient.Secrets(TenantDNSNamespace).Delete(ctx, name, metav1.DeleteOptions{}))
+
+	// ⚠️ And the tenant's own kubernetes Service, which lives in the TENANT's
+	// namespace rather than the platform one and so was missed the first time.
+	// Without a resolver it serves nothing -- the platform's CoreDNS builds that
+	// tenant's records under the upstream namespace, so nothing ever asks for
+	// kubernetes.default.svc in the tenant's view -- and an orphan Service named
+	// "kubernetes" sitting in a tenant namespace is the kind of leftover that
+	// gets explained as deliberate years later.
+	tenantNS := tenantID + "-default"
+	record(tc.upstreamCoreClient.Services(tenantNS).Delete(ctx, "kubernetes", metav1.DeleteOptions{}))
+	if tc.upstreamEndpointSliceClient != nil {
+		record(tc.upstreamEndpointSliceClient.EndpointSlices(tenantNS).Delete(ctx, "kubernetes-kubezoo", metav1.DeleteOptions{}))
+	}
 	return firstErr
 }
 
