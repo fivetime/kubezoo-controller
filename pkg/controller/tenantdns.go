@@ -173,13 +173,21 @@ func (tc *TenantController) ensureTenantDNSCredential(tenantID string) error {
 	ctx := context.TODO()
 	name := tenantDNSName(tenantID)
 	existing, err := tc.upstreamCoreClient.Secrets(TenantDNSNamespace).Get(ctx, name, metav1.GetOptions{})
+	// ⛔ Recorded as a bool BEFORE anything else can touch err. It was read off
+	// err further down at first, and by then err had been reassigned by the
+	// kubeconfig build below -- so a missing secret took the update branch, which
+	// updates nothing and returns "secrets <tid> not found" forever. Every tenant
+	// failed to get a resolver, and the only symptom outside the controller log
+	// was that per-tenant DNS silently never appeared, because the gateway fails
+	// open. Found on a live cluster, not by a test.
+	missing := apierrors.IsNotFound(err)
 	switch {
 	case err == nil:
 		if !tenantDNSCredentialNeedsRenewal(existing) {
 			return nil
 		}
 		klog.InfoS("renewing the tenant resolver credential before it expires", "tenant", tenantID)
-	case apierrors.IsNotFound(err):
+	case missing:
 	default:
 		return err
 	}
@@ -204,7 +212,7 @@ func (tc *TenantController) ensureTenantDNSCredential(tenantID string) error {
 		},
 		Data: map[string][]byte{"kubeconfig": kubeconfig},
 	}
-	if apierrors.IsNotFound(err) {
+	if missing {
 		_, cerr := tc.upstreamCoreClient.Secrets(TenantDNSNamespace).Create(ctx, secret, metav1.CreateOptions{})
 		if apierrors.IsAlreadyExists(cerr) {
 			return nil
