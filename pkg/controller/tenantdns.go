@@ -18,6 +18,9 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"time"
@@ -57,6 +60,10 @@ const (
 	// is tenants quietly going back to the platform resolver.
 	tenantDNSServiceLabelKey = "kubezoo.io/tenant-dns"
 	tenantDNSTenantLabelKey  = "kubezoo.io/tenant"
+
+	// tenantDNSSpecHashAnnotation records the spec this controller asked for,
+	// so a change to it reaches tenants that already have a resolver.
+	tenantDNSSpecHashAnnotation = "kubezoo.io/spec-hash"
 
 	tenantDNSPort     = 5353
 	tenantDNSReadyPrt = 8181
@@ -147,10 +154,9 @@ func (tc *TenantController) ensureTenantDNSNamespace() error {
 			Name: TenantDNSNamespace,
 			Labels: map[string]string{
 				"kubezoo.io/managed": "true",
-				// Baseline rather than restricted: CoreDNS runs unprivileged, and
-				// saying so here keeps a cluster with PodSecurity enforcement from
-				// refusing the Deployment with an admission error that reads as a
-				// kubezoo bug.
+				// The resolver runs unprivileged and the pod spec is written to
+				// satisfy this, NET_BIND_SERVICE included -- which is the one
+				// capability "restricted" permits to be added.
 				"pod-security.kubernetes.io/enforce": "restricted",
 			},
 		},
@@ -409,8 +415,27 @@ func (tc *TenantController) ensureTenantDNSDeployment(tenantID string) error {
 							AllowPrivilegeEscalation: ptr.To(false),
 							RunAsNonRoot:             ptr.To(true),
 							RunAsUser:                ptr.To[int64](65532),
-							Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-							SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+							// ⛔ NET_BIND_SERVICE is not optional, and not because
+							// anything binds a low port -- the resolver listens on
+							// 5353. The CoreDNS binary carries the FILE capability
+							// cap_net_bind_service, and allowPrivilegeEscalation:
+							// false sets no_new_privs, under which the kernel
+							// refuses to exec a file whose permitted set is not
+							// within the container's bounding set. The pod does not
+							// fail a probe or log a DNS error; it never starts, with
+							// "exec container process /coredns: Operation not
+							// permitted" and nothing else. Measured on cri-o+crun.
+							//
+							// This is what the upstream CoreDNS manifest does, and
+							// NET_BIND_SERVICE is the one capability PodSecurity
+							// "restricted" allows to be added, so the namespace label
+							// below still holds.
+							Capabilities: &corev1.Capabilities{
+								Drop: []corev1.Capability{"ALL"},
+								Add:  []corev1.Capability{"NET_BIND_SERVICE"},
+							},
+							ReadOnlyRootFilesystem: ptr.To(true),
+							SeccompProfile:         &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 						},
 						Resources: corev1.ResourceRequirements{
 							Requests: corev1.ResourceList{
@@ -432,6 +457,21 @@ func (tc *TenantController) ensureTenantDNSDeployment(tenantID string) error {
 		},
 	}
 
+	// ⭐ A hash of what this function WANTS, stamped on the object.
+	//
+	// ⚠️ Comparing a few fields instead -- the image and the replica count were
+	// the first attempt -- converges on those and nothing else, so a fix to the
+	// pod spec never reaches the tenants that already have a resolver. The
+	// securityContext repair that made these pods able to start at all would
+	// have shipped and changed nothing.
+	//
+	// ⚠️ And comparing the whole spec cannot work either: the apiserver defaults
+	// fields this does not set, so the stored object never equals the desired one
+	// and every pass would issue an Update. The hash is over what was ASKED for,
+	// which is stable.
+	hash := specHash(&want.Spec)
+	want.Annotations = map[string]string{tenantDNSSpecHashAnnotation: hash}
+
 	existing, err := tc.upstreamAppsClient.Deployments(TenantDNSNamespace).Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		_, cerr := tc.upstreamAppsClient.Deployments(TenantDNSNamespace).Create(ctx, want, metav1.CreateOptions{})
@@ -443,14 +483,22 @@ func (tc *TenantController) ensureTenantDNSDeployment(tenantID string) error {
 	if err != nil {
 		return err
 	}
-	// Only the two things an operator changes between releases. Rewriting the
-	// whole spec every pass would fight anything else that legitimately edits it.
-	if len(existing.Spec.Template.Spec.Containers) == 1 &&
-		existing.Spec.Template.Spec.Containers[0].Image == tc.tenantDNSImage &&
-		ptr.Deref(existing.Spec.Replicas, 1) == tc.tenantDNSReplicas {
+	if existing.Annotations[tenantDNSSpecHashAnnotation] == hash {
 		return nil
 	}
 	want.ResourceVersion = existing.ResourceVersion
 	_, err = tc.upstreamAppsClient.Deployments(TenantDNSNamespace).Update(ctx, want, metav1.UpdateOptions{})
 	return err
+}
+
+// specHash summarises the spec this controller asked for.
+func specHash(spec *appsv1.DeploymentSpec) string {
+	encoded, err := json.Marshal(spec)
+	if err != nil {
+		// Cannot happen for a spec built above, and returning a constant would
+		// make every object look up to date forever.
+		return "unhashable"
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:8])
 }
