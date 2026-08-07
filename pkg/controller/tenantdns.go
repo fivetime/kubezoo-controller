@@ -18,7 +18,10 @@ package controller
 
 import (
 	"context"
+	"crypto"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -29,13 +32,16 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 
+	"github.com/fivetime/kubezoo-contract/pkg/common"
 	"github.com/fivetime/kubezoo-contract/pkg/util"
 )
 
@@ -86,7 +92,39 @@ const (
 	// tenant identity, held by the platform for as long as the tenant exists.
 	tenantDNSCredentialValidity = 365 * 24 * time.Hour
 	tenantDNSCredentialRenewAt  = 30 * 24 * time.Hour
+
+	// TenantDNSOptOutAnnotation, on a Tenant, means "this tenant resolves names
+	// somewhere else -- do not give it a resolver".
+	//
+	// ⭐ This is what keeps the pod spec honest. The gateway only injects
+	// dnsPolicy: None when a resolver exists, so opting a tenant out means its
+	// pods keep the platform resolver and their stored spec says so. Provisioning
+	// a resolver for a tenant whose data plane ignores dnsConfig -- an OpenStack
+	// Zun capsule resolving through Designate, measured -- would store a
+	// nameserver that nothing on that node ever reads: the object would claim a
+	// resolver the pod does not use, and no component anywhere would report the
+	// disagreement.
+	TenantDNSOptOutAnnotation = "kubezoo.io/tenant-dns"
+	tenantDNSOptOutValue      = "disabled"
+
+	// tenantDNSReaderRole is the read-only ClusterRole the resolver's own
+	// identity is bound to.
+	tenantDNSReaderRole = "kubezoo:tenant-dns-reader"
 )
+
+// tenantDNSUser is the identity the resolver authenticates as.
+//
+// ⛔ NOT the tenant's admin user. It used to be: buildTenantDNSKubeconfig called
+// util.NewTenantCertAndKey, which mints CN=<tid>-admin, so a DNS server -- a
+// process that accepts UDP from the network -- held full write over every one of
+// that tenant's namespaces, and the platform stored that key permanently. That
+// second half contradicts the whole point of credential-retention, which exists
+// so the platform stops holding a key that can act as the tenant.
+//
+// Measured on the lab cluster before the change: the resolver's certificate and
+// the tenant's own were byte-for-byte the same subject, OU=<tid> CN=<tid>-admin,
+// and the resolver's expired nine months later.
+func tenantDNSUser(tenantID string) string { return tenantID + "-dns" }
 
 // tenantDNSName is the name every per-tenant object gets. The Service being
 // named for its tenant is what makes the gateway's lookup a keyed one.
@@ -104,7 +142,16 @@ func (tc *TenantController) syncTenantDNS(tenantID string) error {
 		// the tenant keeps the platform resolver rather than getting none.
 		return nil
 	}
+	if tc.tenantOptedOutOfDNS(tenantID) {
+		// ⭐ Torn down rather than merely skipped. A tenant that had a resolver and
+		// is then opted out must stop having one, or the gateway keeps finding its
+		// Service and keeps writing a nameserver into pods that will not use it.
+		return tc.deleteTenantDNS(tenantID)
+	}
 	if err := tc.ensureTenantDNSNamespace(); err != nil {
+		return err
+	}
+	if err := tc.ensureTenantDNSRBAC(tenantID); err != nil {
 		return err
 	}
 	if err := tc.ensureTenantDNSCredential(tenantID); err != nil {
@@ -380,12 +427,34 @@ func tenantDNSCredentialNeedsRenewal(secret *corev1.Secret) bool {
 // buildTenantDNSKubeconfig signs a client certificate carrying the tenant's
 // identity and wraps it in a kubeconfig pointed at kubezoo.
 func (tc *TenantController) buildTenantDNSKubeconfig(tenantID string) ([]byte, time.Time, error) {
-	cert, key, err := util.NewTenantCertAndKey(tc.clientCAFile, tc.clientCAKeyFile, tenantID,
-		tenantDNSCredentialValidity)
+	// ⛔ Signed here rather than through util.NewTenantCertAndKey, which hardcodes
+	// CN=<tid>-admin. A resolver needs get/list/watch on three resource kinds; it
+	// was being handed the tenant's administrator.
+	tlsCert, err := tls.LoadX509KeyPair(tc.clientCAFile, tc.clientCAKeyFile)
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("loading the tenant CA: %w", err)
+	}
+	caKey, ok := tlsCert.PrivateKey.(crypto.Signer)
+	if !ok {
+		return nil, time.Time{}, fmt.Errorf("the tenant CA key is not a crypto.Signer")
+	}
+	caCert, err := x509.ParseCertificate(tlsCert.Certificate[0])
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("parsing the tenant CA: %w", err)
+	}
+	cert, key, err := util.NewCertAndKey(caCert, caKey, &util.Config{
+		// The OU still names the tenant -- that is how kubezoo decides whose
+		// objects a request is about, and the resolver must see that tenant's.
+		// Only the CN changes, and the CN is the RBAC subject.
+		OrganizationalUnit: []string{tenantID},
+		CommonName:         tenantDNSUser(tenantID),
+		Usages:             []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		Validity:           tenantDNSCredentialValidity,
+	})
 	if err != nil {
 		return nil, time.Time{}, fmt.Errorf("signing the resolver credential for tenant %s: %w", tenantID, err)
 	}
-	caCert, err := os.ReadFile(tc.clientCAFile)
+	caCertPEM, err := os.ReadFile(tc.clientCAFile)
 	if err != nil {
 		return nil, time.Time{}, err
 	}
@@ -393,7 +462,7 @@ func (tc *TenantController) buildTenantDNSKubeconfig(tenantID string) ([]byte, t
 	// is a cross-cluster connection and the address has to be the external one --
 	// the same kubeZooHostAddress a tenant's own kubeconfig gets. A Service name
 	// would resolve to nothing from here.
-	kubeconfig, err := util.GenKubeconfig("https://"+tc.kubeZooHostAddress, tenantID, caCert,
+	kubeconfig, err := util.GenKubeconfig("https://"+tc.kubeZooHostAddress, tenantID, caCertPEM,
 		util.EncodePrivateKeyPEM(key), util.EncodeCertPEM(cert))
 	if err != nil {
 		return nil, time.Time{}, err
@@ -416,7 +485,13 @@ func tenantDNSCorefile(tenantID, clusterDomain string) string {
     prometheus :9153
     kubernetes %s in-addr.arpa ip6.arpa {
         kubeconfig /etc/coredns-kubeconfig/kubeconfig
-        pods verified
+        # ⛔ Disabled, not "verified". Verified makes CoreDNS watch EVERY pod the
+        # tenant runs, and that informer cache is where a resolver's memory
+        # actually goes -- so the 256Mi limit below becomes an OOMKill that
+        # arrives at whatever pod count a particular tenant happens to reach,
+        # with "DNS is flaky" as the only symptom. What it buys is
+        # 10-1-2-3.ns.pod.<zone> records, which almost nothing uses.
+        pods disabled
         ttl 5
     }
     forward . /etc/resolv.conf
@@ -630,4 +705,92 @@ func specHash(spec *appsv1.DeploymentSpec) string {
 	}
 	sum := sha256.Sum256(encoded)
 	return hex.EncodeToString(sum[:8])
+}
+
+// tenantOptedOutOfDNS reports whether this tenant resolves names elsewhere.
+//
+// ⭐ Exists because a resolver a tenant's pods cannot use is worse than no
+// resolver: the gateway would write dnsPolicy: None and a nameserver into every
+// pod, the stored spec would claim a resolver the runtime ignores, and nothing
+// would report the disagreement. Measured on an OpenStack Zun capsule, whose DNS
+// comes from Designate and which discards dnsConfig entirely -- by design, not
+// as a gap: that data plane has its own DNS story.
+func (tc *TenantController) tenantOptedOutOfDNS(tenantID string) bool {
+	tenant, err := tc.tenantLister.Get(tenantID)
+	if err != nil {
+		// ⚠️ Treated as opted IN, matching suspensionModeOf: assuming the
+		// restrictive answer on a transient cache miss would tear down every
+		// tenant's resolver at once, which is far worse than briefly leaving one
+		// standing for a tenant that asked not to have it.
+		klog.Warningf("cannot read tenant %s to check its DNS opt-out, provisioning a resolver: %v",
+			tenantID, err)
+		return false
+	}
+	return tenant.Annotations[TenantDNSOptOutAnnotation] == tenantDNSOptOutValue
+}
+
+// ensureTenantDNSRBAC grants the resolver's own identity what it reads, and
+// nothing else.
+//
+// ⛔ Namespace RoleBindings, never a ClusterRoleBinding for this user. rbac.go
+// says why in full: a cluster-scoped grant cannot be bounded by name, so held by
+// a USER it is a grant over every tenant's cluster-scoped objects. The tenant's
+// own cluster-scoped access is deliberately held by a group kubezoo asserts only
+// on a forwarded request; binding this user cluster-wide would reopen exactly
+// that hole for the sake of a DNS server.
+func (tc *TenantController) ensureTenantDNSRBAC(tenantID string) error {
+	ctx := context.TODO()
+	role := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{Name: tenantDNSReaderRole},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{""},
+				Resources: []string{"services", "namespaces"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"discovery.k8s.io"},
+				Resources: []string{"endpointslices"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			// ⚠️ No pods. The Corefile says "pods disabled" for the memory reason
+			// written there, and a grant for something nothing reads is a grant
+			// that outlives the reason it was added.
+		},
+	}
+	if _, err := tc.upstreamRbacClient.ClusterRoles().Create(ctx, role, metav1.CreateOptions{}); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("creating %s: %w", tenantDNSReaderRole, err)
+		}
+		if _, err := tc.upstreamRbacClient.ClusterRoles().Update(ctx, role, metav1.UpdateOptions{}); err != nil {
+			return fmt.Errorf("reconciling %s: %w", tenantDNSReaderRole, err)
+		}
+	}
+
+	namespaces, err := tc.upstreamCoreClient.Namespaces().List(ctx, metav1.ListOptions{
+		LabelSelector: labels.SelectorFromSet(labels.Set{common.TenantNamespaceLabelKey: tenantID}).String(),
+	})
+	if err != nil {
+		return err
+	}
+	for i := range namespaces.Items {
+		ns := namespaces.Items[i]
+		if ns.Status.Phase == corev1.NamespaceTerminating {
+			continue
+		}
+		binding := &rbacv1.RoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: tenantDNSReaderRole, Namespace: ns.Name},
+			RoleRef: rbacv1.RoleRef{
+				APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: tenantDNSReaderRole,
+			},
+			Subjects: []rbacv1.Subject{{
+				APIGroup: rbacv1.GroupName, Kind: rbacv1.UserKind, Name: tenantDNSUser(tenantID),
+			}},
+		}
+		_, err := tc.upstreamRbacClient.RoleBindings(ns.Name).Create(ctx, binding, metav1.CreateOptions{})
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("granting the resolver read in %s: %w", ns.Name, err)
+		}
+	}
+	return nil
 }

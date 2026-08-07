@@ -22,10 +22,12 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -255,5 +257,89 @@ func TestTenantKubernetesServiceSkippedForANonIPAddress(t *testing.T) {
 	}
 	if _, err := client.CoreV1().Services("111111-default").Get(context.TODO(), "kubernetes", metav1.GetOptions{}); err == nil {
 		t.Error("a Service was created whose EndpointSlice cannot be written")
+	}
+}
+
+// TestResolverCredentialIsNotTheTenantAdmin is the regression guard for a
+// defect that reached a live cluster and was found by reading a Secret.
+//
+// ⛔ The resolver used to authenticate as CN=<tid>-admin -- byte-for-byte the
+// same subject as the tenant's own kubeconfig. So a DNS server, a process that
+// accepts UDP from the network, held full write over every one of that tenant's
+// namespaces; and the platform stored that key permanently, which is precisely
+// what credential-retention exists to prevent ("the platform hands it over once
+// and then stops holding the tenant's private key").
+//
+// The OU must still name the tenant -- that is how kubezoo decides whose objects
+// a request concerns -- so this checks the two halves separately.
+func TestResolverCredentialIsNotTheTenantAdmin(t *testing.T) {
+	caFile, caKeyFile := writeTestCA(t)
+	client := fake.NewSimpleClientset()
+	tc := &TenantController{
+		upstreamCoreClient: client.CoreV1(),
+		clientCAFile:       caFile,
+		clientCAKeyFile:    caKeyFile,
+		kubeZooHostAddress: "10.0.0.1:6443",
+	}
+	if err := tc.ensureTenantDNSCredential("111111"); err != nil {
+		t.Fatalf("provisioning: %v", err)
+	}
+	secret, _ := client.CoreV1().Secrets(TenantDNSNamespace).Get(context.TODO(), "111111", metav1.GetOptions{})
+
+	var certPEM []byte
+	for _, line := range strings.Split(string(secret.Data["kubeconfig"]), "\n") {
+		if strings.Contains(line, "client-certificate-data:") {
+			raw := strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
+			decoded, err := base64.StdEncoding.DecodeString(raw)
+			if err != nil {
+				t.Fatalf("decoding the embedded certificate: %v", err)
+			}
+			certPEM = decoded
+		}
+	}
+	if certPEM == nil {
+		t.Fatal("the kubeconfig carries no client certificate")
+	}
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		t.Fatal("the client certificate is not PEM")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("parsing the client certificate: %v", err)
+	}
+
+	if cert.Subject.CommonName == "111111-admin" {
+		t.Error("the resolver authenticates as the tenant ADMINISTRATOR. It needs get/list/watch " +
+			"on three resource kinds; this gives a network-facing DNS server write over every one " +
+			"of the tenant's namespaces, and makes the platform a permanent holder of a key that " +
+			"acts as the tenant")
+	}
+	if cert.Subject.CommonName != "111111-dns" {
+		t.Errorf("CN = %q, want 111111-dns", cert.Subject.CommonName)
+	}
+	// ⚠️ The other half. Dropping the OU would not fail any RBAC assertion -- it
+	// would make kubezoo unable to tell whose objects the resolver is asking
+	// about, which surfaces as an empty zone rather than an error.
+	if len(cert.Subject.OrganizationalUnit) != 1 || cert.Subject.OrganizationalUnit[0] != "111111" {
+		t.Errorf("OU = %v, want [111111]; kubezoo derives the tenant from it",
+			cert.Subject.OrganizationalUnit)
+	}
+}
+
+// TestCorefileDoesNotWatchPods -- "pods verified" makes CoreDNS hold an informer
+// over every pod the tenant runs, which is where a resolver's memory actually
+// goes. The 256Mi limit then becomes an OOMKill that arrives at whatever pod
+// count a given tenant reaches, with "DNS is flaky" as the only symptom. What it
+// buys is 10-1-2-3.ns.pod.<zone> records, which almost nothing uses.
+func TestCorefileDoesNotWatchPods(t *testing.T) {
+	corefile := tenantDNSCorefile("111111", "cluster.local")
+	if strings.Contains(corefile, "pods verified") || strings.Contains(corefile, "pods insecure") {
+		t.Errorf("the resolver watches pods:\n%s\n\nmemory then scales with the tenant's pod "+
+			"count against a fixed limit", corefile)
+	}
+	if !strings.Contains(corefile, "pods disabled") {
+		t.Errorf("the pod-watching mode is not stated explicitly:\n%s\n\nleaving it out takes "+
+			"CoreDNS's default rather than a decision", corefile)
 	}
 }
