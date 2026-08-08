@@ -722,11 +722,14 @@ func (tc *TenantController) ensureTenantDNSDeployment(tenantID string) error {
 	// tenant namespace, for policies that need to tell it apart.
 	//
 	// ⚠️ It is NOT an exemption from placement. It briefly was, on the reasoning
-	// that the tenant's pool is a virtual kubelet that cannot serve a ClusterIP --
-	// which turned out to be wrong: the knaas provider gives each Service an
-	// Octavia load balancer whose VIP is that Service's ClusterIP, so a capsule
-	// reaches it for real, with members taken from the EndpointSlice and gated on
-	// readiness.
+	// that the tenant's pool is a virtual kubelet that cannot serve a ClusterIP.
+	// That reasoning was right about the ClusterIP and wrong about the
+	// conclusion: the knaas provider gives each Service an Octavia load balancer
+	// with members taken from the EndpointSlice and gated on readiness, but the
+	// VIP is allocated on the TENANT's network, so the address a capsule can
+	// actually use is not the ClusterIP the upstream cluster assigned. Closing
+	// that gap is a translation at the kubezoo boundary, not a reason to keep the
+	// resolver off the pool.
 	//
 	// ⭐ The resolver in fact HAS to land on the pool: only there does its pod get
 	// an OVN address, and only an OVN address can be a load balancer member. A
