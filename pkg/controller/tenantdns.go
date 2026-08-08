@@ -124,6 +124,14 @@ const (
 	tenantDNSReaderRole = "kubezoo:tenant-dns-reader"
 )
 
+// tenantDNSReaderBinding names the per-tenant ClusterRoleBinding that carries
+// the resolver's read. Per tenant, never one shared binding: the subject is what
+// keeps one tenant's resolver out of another's, so a shared binding would have
+// to list every tenant and would grant each of them the others' reach.
+func tenantDNSReaderBinding(tenantID string) string {
+	return tenantDNSReaderRole + ":" + tenantID
+}
+
 // tenantDNSUser is the identity the resolver authenticates as.
 //
 // ⛔ NOT the tenant's admin user. It used to be: buildTenantDNSKubeconfig called
@@ -337,6 +345,20 @@ func (tc *TenantController) deleteTenantDNS(tenantID string) error {
 	record(tc.upstreamCoreClient.Services(tenantNS).Delete(ctx, "kubernetes", metav1.DeleteOptions{}))
 	if tc.upstreamEndpointSliceClient != nil {
 		record(tc.upstreamEndpointSliceClient.EndpointSlices(tenantNS).Delete(ctx, "kubernetes-kubezoo", metav1.DeleteOptions{}))
+	}
+
+	// ⛔ And the authorization. This was missed entirely: teardown removed every
+	// object that costs something to run and left the grant behind, so a tenant
+	// that had DNS once kept a standing cluster-wide read for an identity with
+	// no pod to use it. Cluster-scoped, so nothing garbage-collects it with the
+	// tenant's namespaces either -- an audit found twelve of these still bound.
+	//
+	// The ClusterRole itself is shared by every tenant and deliberately survives:
+	// it grants nothing once no binding names it, and deleting it while another
+	// tenant still resolves would take that tenant's DNS down.
+	record(tc.upstreamRbacClient.ClusterRoleBindings().Delete(ctx, tenantDNSReaderBinding(tenantID), metav1.DeleteOptions{}))
+	if err := tc.removeTenantDNSNamespaceBindings(ctx, tenantID); err != nil && firstErr == nil {
+		firstErr = err
 	}
 	return firstErr
 }
@@ -782,12 +804,30 @@ func (tc *TenantController) tenantOptedOutOfDNS(tenantID string) bool {
 // ensureTenantDNSRBAC grants the resolver's own identity what it reads, and
 // nothing else.
 //
-// ⛔ Namespace RoleBindings, never a ClusterRoleBinding for this user. rbac.go
-// says why in full: a cluster-scoped grant cannot be bounded by name, so held by
-// a USER it is a grant over every tenant's cluster-scoped objects. The tenant's
-// own cluster-scoped access is deliberately held by a group kubezoo asserts only
-// on a forwarded request; binding this user cluster-wide would reopen exactly
-// that hole for the sake of a DNS server.
+// ⛔ This used to bind the ClusterRole with namespace RoleBindings only, on the
+// reasoning that a cluster-scoped grant held by a USER is a grant over every
+// tenant's cluster-scoped objects. That reasoning was wrong here, and the cost
+// of the mistake was that CoreDNS could never start: a RoleBinding cannot grant
+// list/watch on `namespaces`, which is cluster-scoped, and the kubernetes plugin
+// needs it. The resolver sat at Plugins not ready: "kubernetes" forever, and the
+// gateway -- which by then refuses a resolver that is not serving -- correctly
+// declined to inject it, so the whole feature was silently off.
+//
+// ⭐ What makes the ClusterRoleBinding safe is that the subject is per-tenant.
+// The premise behind the old comment was that kubezoo strips the tenant prefix
+// from a certificate's CN, so every tenant's resolver would authenticate as the
+// same bare `dns` and one cluster-wide grant would cover them all. It does not
+// strip it: CommonNameUserConversion sets Name = CommonName verbatim, so the
+// subject really is `<tid>-dns` and the grant reaches one tenant's resolver.
+// (The prefix does get stripped from the NAME QUOTED BACK in a Forbidden
+// message, which is what made it look otherwise -- read the subject of the
+// binding that works, not the error text of the one that does not.)
+//
+// ⭐ And the grant cannot leak across tenants even though the rule is
+// cluster-wide, because the resolver reaches the API only through kubezoo, which
+// filters a cluster-scoped list to the tenant's own objects. Measured on the
+// live cluster: the resolver for 111111 listing namespaces gets its own four,
+// prefix-stripped, and nothing belonging to 222222.
 func (tc *TenantController) ensureTenantDNSRBAC(tenantID string) error {
 	ctx := context.TODO()
 	role := &rbacv1.ClusterRole{
@@ -817,6 +857,57 @@ func (tc *TenantController) ensureTenantDNSRBAC(tenantID string) error {
 		}
 	}
 
+	binding := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: tenantDNSReaderBinding(tenantID)},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: tenantDNSReaderRole,
+		},
+		Subjects: []rbacv1.Subject{{
+			APIGroup: rbacv1.GroupName, Kind: rbacv1.UserKind, Name: tenantDNSUser(tenantID),
+		}},
+	}
+	// ⚠️ Create-then-Update, not Create-and-swallow-AlreadyExists. A binding
+	// reconciled only on creation is a binding whose Subjects and RoleRef stop
+	// converging the moment either changes -- and the identity in Subjects is
+	// exactly the field a future change to how the resolver authenticates would
+	// move. The existing objects on the live cluster were written by hand while
+	// diagnosing this and have to be reconciled into shape, not left alone.
+	if _, err := tc.upstreamRbacClient.ClusterRoleBindings().Create(ctx, binding, metav1.CreateOptions{}); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("granting the resolver read for %s: %w", tenantID, err)
+		}
+		existing, getErr := tc.upstreamRbacClient.ClusterRoleBindings().Get(ctx, binding.Name, metav1.GetOptions{})
+		if getErr != nil {
+			return fmt.Errorf("reading %s: %w", binding.Name, getErr)
+		}
+		// RoleRef is immutable, so a binding pointing somewhere else has to be
+		// replaced rather than updated.
+		if existing.RoleRef != binding.RoleRef {
+			if err := tc.upstreamRbacClient.ClusterRoleBindings().Delete(ctx, binding.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("replacing %s: %w", binding.Name, err)
+			}
+			if _, err := tc.upstreamRbacClient.ClusterRoleBindings().Create(ctx, binding, metav1.CreateOptions{}); err != nil {
+				return fmt.Errorf("replacing %s: %w", binding.Name, err)
+			}
+		} else {
+			existing.Subjects = binding.Subjects
+			if _, err := tc.upstreamRbacClient.ClusterRoleBindings().Update(ctx, existing, metav1.UpdateOptions{}); err != nil {
+				return fmt.Errorf("reconciling %s: %w", binding.Name, err)
+			}
+		}
+	}
+
+	return tc.removeTenantDNSNamespaceBindings(ctx, tenantID)
+}
+
+// removeTenantDNSNamespaceBindings clears the per-namespace RoleBindings this
+// function used to write.
+//
+// ⚠️ They granted the resolver nothing it does not now hold cluster-wide, so
+// leaving them would be invisible rather than harmful -- which is the reason to
+// remove them deliberately instead of trusting that. A grant nobody can explain
+// is a grant nobody dares delete later.
+func (tc *TenantController) removeTenantDNSNamespaceBindings(ctx context.Context, tenantID string) error {
 	namespaces, err := tc.upstreamCoreClient.Namespaces().List(ctx, metav1.ListOptions{
 		LabelSelector: labels.SelectorFromSet(labels.Set{common.TenantNamespaceLabelKey: tenantID}).String(),
 	})
@@ -828,18 +919,9 @@ func (tc *TenantController) ensureTenantDNSRBAC(tenantID string) error {
 		if ns.Status.Phase == corev1.NamespaceTerminating {
 			continue
 		}
-		binding := &rbacv1.RoleBinding{
-			ObjectMeta: metav1.ObjectMeta{Name: tenantDNSReaderRole, Namespace: ns.Name},
-			RoleRef: rbacv1.RoleRef{
-				APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: tenantDNSReaderRole,
-			},
-			Subjects: []rbacv1.Subject{{
-				APIGroup: rbacv1.GroupName, Kind: rbacv1.UserKind, Name: tenantDNSUser(tenantID),
-			}},
-		}
-		_, err := tc.upstreamRbacClient.RoleBindings(ns.Name).Create(ctx, binding, metav1.CreateOptions{})
-		if err != nil && !apierrors.IsAlreadyExists(err) {
-			return fmt.Errorf("granting the resolver read in %s: %w", ns.Name, err)
+		err := tc.upstreamRbacClient.RoleBindings(ns.Name).Delete(ctx, tenantDNSReaderRole, metav1.DeleteOptions{})
+		if err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("removing the superseded resolver binding in %s: %w", ns.Name, err)
 		}
 	}
 	return nil
