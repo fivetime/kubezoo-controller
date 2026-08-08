@@ -93,8 +93,8 @@ const (
 	tenantDNSTenantLabelKey  = "kubezoo.io/tenant"
 
 	// tenantDNSPlatformLabelKey marks a pod the platform runs inside a tenant's
-	// namespace, so admission policies written for tenant workloads can exclude
-	// it. See where it is set for why this one cannot be skipped.
+	// namespace, so a policy that needs to tell it apart from tenant workload can.
+	// ⚠️ Not an exemption from placement -- see where it is set.
 	tenantDNSPlatformLabelKey = "kubezoo.io/platform-workload"
 
 	// tenantDNSSpecHashAnnotation records the spec this controller asked for,
@@ -139,11 +139,16 @@ const (
 	// ⭐ This is what keeps the pod spec honest. The gateway only injects
 	// dnsPolicy: None when a resolver exists, so opting a tenant out means its
 	// pods keep the platform resolver and their stored spec says so. Provisioning
-	// a resolver for a tenant whose data plane ignores dnsConfig -- an OpenStack
-	// Zun capsule resolving through Designate, measured -- would store a
-	// nameserver that nothing on that node ever reads: the object would claim a
-	// resolver the pod does not use, and no component anywhere would report the
-	// disagreement.
+	// a resolver for a data plane that ignores dnsConfig would store a nameserver
+	// nothing on that node ever reads: the object would claim a resolver the pod
+	// does not use, and no component anywhere would report the disagreement.
+	//
+	// ⚠️ The example this was written for -- an OpenStack Zun capsule -- is no
+	// longer one. The knaas provider composes a capsule's search list itself, and
+	// reading spec.dnsConfig instead makes the injected values the ones that take
+	// effect; the resolver's ClusterIP is reachable there because that Service's
+	// Octavia VIP *is* its ClusterIP. Where the annotation still applies is a data
+	// plane that reads neither.
 	TenantDNSOptOutAnnotation = "kubezoo.io/tenant-dns"
 	tenantDNSOptOutValue      = "disabled"
 
@@ -713,15 +718,20 @@ func (tc *TenantController) ensureTenantDNSService(tenantID string) error {
 func (tc *TenantController) ensureTenantDNSDeployment(tenantID string) error {
 	ctx := context.TODO()
 	name := tenantDNSName(tenantID)
-	// ⛔ tenantDNSPlatformLabelKey is what keeps the placement policy off this pod,
-	// and it is load-bearing now that the resolver lives in the tenant's own
-	// kube-system. That policy matches every namespace carrying kubezoo.io/tenant
-	// -- which <tid>-kube-system does -- and injects nodeSelector
-	// kubezoo.io/pool=<tid>. On this deployment that pool is a virtual kubelet
-	// that does not implement ClusterIP, so the resolver would be scheduled onto
-	// a node where it cannot serve, and the only symptom would be a resolver that
-	// never becomes ready. The policy in kubezoo-contract excludes this label;
-	// a deployment running some other placement policy has to do the same.
+	// tenantDNSPlatformLabelKey marks this as the platform's own pod inside a
+	// tenant namespace, for policies that need to tell it apart.
+	//
+	// ⚠️ It is NOT an exemption from placement. It briefly was, on the reasoning
+	// that the tenant's pool is a virtual kubelet that cannot serve a ClusterIP --
+	// which turned out to be wrong: the knaas provider gives each Service an
+	// Octavia load balancer whose VIP is that Service's ClusterIP, so a capsule
+	// reaches it for real, with members taken from the EndpointSlice and gated on
+	// readiness.
+	//
+	// ⭐ The resolver in fact HAS to land on the pool: only there does its pod get
+	// an OVN address, and only an OVN address can be a load balancer member. A
+	// resolver running on the platform's own workers is the broken arrangement --
+	// it holds a ClusterIP that the tenant's capsules cannot reach.
 	labels := map[string]string{
 		tenantDNSTenantLabelKey:   tenantID,
 		tenantDNSPlatformLabelKey: "true",
