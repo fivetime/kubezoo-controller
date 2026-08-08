@@ -115,7 +115,15 @@ const (
 	// -- and the label is the claim. A resolver off its data path has no business
 	// making it. The stock NAMES stay (Deployment coredns, Service kube-dns):
 	// those are what a tenant reads, and they collide with nothing.
-	tenantDNSAppLabel = "kubezoo-dns"
+	//
+	// ⚠️ And it deliberately does not say "kubezoo". A tenant reading its own
+	// kube-system should see a resolver, not the name of the layer that put it
+	// there -- naming the platform is an invitation to go looking for its edges.
+	// ⛔ Do not mistake this for hiding kubezoo: a tenant still sees kubezoo.io
+	// annotations on its own Services, kubezoo.io labels on its namespaces, and
+	// kubezoo's own wording in the errors it gets back. This label is one word,
+	// not a boundary.
+	tenantDNSAppLabel = "core-dns"
 
 	// tenantDNSSpecHashAnnotation records the spec this controller asked for,
 	// so a change to it reaches tenants that already have a resolver.
