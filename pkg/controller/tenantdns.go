@@ -57,16 +57,26 @@ const (
 	// radius stops at the tenant that did it.
 	LegacyTenantDNSNamespace = "kubezoo-tenant-dns"
 
-	// TenantDNSName is what every resolver object is called inside the tenant's
-	// own kube-system.
+	// TenantDNSName and TenantDNSServiceName are what the resolver is called
+	// inside the tenant's own kube-system.
+	//
+	// ⭐ The names a stock cluster uses: the workload is `coredns` and the Service
+	// is `kube-dns`. They differ upstream for backwards compatibility, and copying
+	// that is the point -- a tenant reading its own kube-system should see what it
+	// would see anywhere else, and anything reaching for kube-dns by convention
+	// should find it.
 	//
 	// ⚠️ Fixed rather than per-tenant, and that is load-bearing: the gateway
 	// watches EndpointSlices with the static label selector
-	// kubernetes.io/service-name=<this>, which is only possible because the
-	// Service has the same name in every tenant. A per-tenant name would force a
+	// kubernetes.io/service-name=<the Service name>, which is only possible
+	// because it is the same in every tenant. A per-tenant name would force a
 	// selector-free cluster-wide EndpointSlice watch -- every slice in the
 	// cluster, for three objects.
-	TenantDNSName = "kubezoo-dns"
+	//
+	// ⚠️ The platform owns these names inside a tenant's kube-system: the
+	// reconciler will adopt and overwrite an object a tenant put there first.
+	TenantDNSName        = "coredns"
+	TenantDNSServiceName = "kube-dns"
 
 	// tenantDNSServiceLabelKey and tenantDNSTenantLabelKey are what the gateway
 	// selects and keys on. Changing either here without changing pkg/tenantdns
@@ -140,6 +150,11 @@ const (
 	// tenantDNSReaderRole is the read-only ClusterRole the resolver's own
 	// identity is bound to.
 	tenantDNSReaderRole = "kubezoo:tenant-dns-reader"
+
+	// renamedTenantDNSName is what the resolver was briefly called inside the
+	// tenant namespace before the stock names were adopted. Only the cleanup path
+	// refers to it.
+	renamedTenantDNSName = "kubezoo-dns"
 )
 
 // tenantDNSReaderBinding names the per-tenant ClusterRoleBinding that carries
@@ -368,7 +383,7 @@ func (tc *TenantController) deleteTenantDNS(tenantID string) error {
 		}
 	}
 	record(tc.upstreamAppsClient.Deployments(tenantDNSNamespace(tenantID)).Delete(ctx, name, metav1.DeleteOptions{}))
-	record(tc.upstreamCoreClient.Services(tenantDNSNamespace(tenantID)).Delete(ctx, name, metav1.DeleteOptions{}))
+	record(tc.upstreamCoreClient.Services(tenantDNSNamespace(tenantID)).Delete(ctx, TenantDNSServiceName, metav1.DeleteOptions{}))
 	record(tc.upstreamCoreClient.ConfigMaps(tenantDNSNamespace(tenantID)).Delete(ctx, name, metav1.DeleteOptions{}))
 	record(tc.upstreamCoreClient.Secrets(tenantDNSNamespace(tenantID)).Delete(ctx, name, metav1.DeleteOptions{}))
 
@@ -432,6 +447,16 @@ func (tc *TenantController) removeLegacyTenantDNS(tenantID string) error {
 	record(tc.upstreamCoreClient.Services(LegacyTenantDNSNamespace).Delete(ctx, legacy, metav1.DeleteOptions{}))
 	record(tc.upstreamCoreClient.ConfigMaps(LegacyTenantDNSNamespace).Delete(ctx, legacy, metav1.DeleteOptions{}))
 	record(tc.upstreamCoreClient.Secrets(LegacyTenantDNSNamespace).Delete(ctx, legacy, metav1.DeleteOptions{}))
+
+	// ⚠️ And the short-lived kubezoo-dns generation, which lived in the tenant's
+	// own namespace under a name the platform picked before deciding to use the
+	// stock ones. A rename is a create plus an orphan unless the old name is
+	// named explicitly somewhere; this is that somewhere.
+	ns := tenantDNSNamespace(tenantID)
+	record(tc.upstreamAppsClient.Deployments(ns).Delete(ctx, renamedTenantDNSName, metav1.DeleteOptions{}))
+	record(tc.upstreamCoreClient.Services(ns).Delete(ctx, renamedTenantDNSName, metav1.DeleteOptions{}))
+	record(tc.upstreamCoreClient.ConfigMaps(ns).Delete(ctx, renamedTenantDNSName, metav1.DeleteOptions{}))
+	record(tc.upstreamCoreClient.Secrets(ns).Delete(ctx, renamedTenantDNSName, metav1.DeleteOptions{}))
 	return firstErr
 }
 
@@ -640,13 +665,23 @@ func (tc *TenantController) ensureTenantDNSConfig(tenantID string) error {
 
 func (tc *TenantController) ensureTenantDNSService(tenantID string) error {
 	ctx := context.TODO()
-	name := tenantDNSName(tenantID)
+	name := TenantDNSServiceName
 	_, err := tc.upstreamCoreClient.Services(tenantDNSNamespace(tenantID)).Get(ctx, name, metav1.GetOptions{})
 	if err == nil {
 		// ⚠️ Not repaired in place. The ClusterIP is what the gateway has already
 		// written into every pod this tenant is running; rewriting the Service
 		// could reallocate it and leave those pods pointed at nothing, and a pod
 		// cannot be updated to a new one because dnsConfig is immutable.
+		//
+		// ⛔ The same argument makes RENAMING this Service a breaking change
+		// rather than a cosmetic one: a new name is a new object with a new
+		// ClusterIP, and every pod already carrying the old address keeps it
+		// until it is recreated. Those pods have dnsPolicy None, which has no
+		// fallback, so they do not degrade -- they lose DNS outright. The
+		// kubezoo-dns -> kube-dns rename was safe only because it happened
+		// before any tenant workload had been injected. Verify that again
+		// before renaming: kubectl get pod -A -o custom-columns with
+		// .spec.dnsConfig.nameservers is the check.
 		return nil
 	}
 	if !apierrors.IsNotFound(err) {
@@ -662,7 +697,7 @@ func (tc *TenantController) ensureTenantDNSService(tenantID string) error {
 			},
 		},
 		Spec: corev1.ServiceSpec{
-			Selector: map[string]string{tenantDNSTenantLabelKey: tenantID, "app": "kubezoo-tenant-dns"},
+			Selector: map[string]string{tenantDNSTenantLabelKey: tenantID, "k8s-app": "kube-dns"},
 			Ports: []corev1.ServicePort{
 				{Name: "dns-udp", Port: 53, TargetPort: intstr.FromInt32(tenantDNSPort), Protocol: corev1.ProtocolUDP},
 				{Name: "dns-tcp", Port: 53, TargetPort: intstr.FromInt32(tenantDNSPort), Protocol: corev1.ProtocolTCP},
@@ -690,7 +725,10 @@ func (tc *TenantController) ensureTenantDNSDeployment(tenantID string) error {
 	labels := map[string]string{
 		tenantDNSTenantLabelKey:   tenantID,
 		tenantDNSPlatformLabelKey: "true",
-		"app":                     "kubezoo-tenant-dns",
+		// ⭐ The label a stock cluster's CoreDNS carries, for the same reason the
+		// names match it: what the tenant sees in its own kube-system should be
+		// what it would see in any cluster.
+		"k8s-app": "kube-dns",
 	}
 
 	// ⛔ The credential's fingerprint rides on the POD TEMPLATE, so reissuing it
