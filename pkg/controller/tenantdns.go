@@ -46,28 +46,46 @@ import (
 )
 
 const (
-	// TenantDNSNamespace is where every tenant's resolver lives.
+	// LegacyTenantDNSNamespace is the platform namespace resolvers used to live
+	// in, kept only so the reconciler can clean up what it no longer owns.
 	//
-	// ⛔ A PLATFORM namespace, never the tenant's own <tid>-kube-system. A tenant
-	// holds namespaced write on every namespace kubezoo makes for it, so a
-	// resolver kept there is one the tenant can repoint at an address of its
-	// choosing -- and because the pods reading it are that same tenant's, nothing
-	// upstream would report an error. It would simply resolve differently.
+	// A tenant billed for a pod has to be able to see that pod, and a resolver in
+	// a platform namespace is invisible to the tenant paying for it. That is why
+	// it moved; the objection recorded here before -- that a tenant holds write
+	// on its own namespaces and could repoint its resolver -- is real but
+	// self-inflicted: the pods reading it are that same tenant's, so the blast
+	// radius stops at the tenant that did it.
+	LegacyTenantDNSNamespace = "kubezoo-tenant-dns"
+
+	// TenantDNSName is what every resolver object is called inside the tenant's
+	// own kube-system.
 	//
-	// ⚠️ Duplicated in the gateway's pkg/tenantdns, and NOTHING checks the two
-	// against each other -- they are separate repositories, so no test can see
-	// both. A change to one alone makes every lookup miss, and a miss fails open,
-	// so the only symptom is tenants quietly going back to the platform resolver.
-	// These belong in kubezoo-contract, which both already depend on; moving them
-	// there costs a contract release, which is why it has not happened yet.
-	TenantDNSNamespace = "kubezoo-tenant-dns"
+	// ⚠️ Fixed rather than per-tenant, and that is load-bearing: the gateway
+	// watches EndpointSlices with the static label selector
+	// kubernetes.io/service-name=<this>, which is only possible because the
+	// Service has the same name in every tenant. A per-tenant name would force a
+	// selector-free cluster-wide EndpointSlice watch -- every slice in the
+	// cluster, for three objects.
+	TenantDNSName = "kubezoo-dns"
 
 	// tenantDNSServiceLabelKey and tenantDNSTenantLabelKey are what the gateway
 	// selects and keys on. Changing either here without changing pkg/tenantdns
 	// there makes every lookup miss -- and a miss fails open, so the only symptom
 	// is tenants quietly going back to the platform resolver.
+	//
+	// ⚠️ Duplicated in the gateway's pkg/tenantdns, and NOTHING checks the two
+	// against each other -- they are separate repositories, so no test can see
+	// both. These belong in kubezoo-contract, which both already depend on;
+	// moving them there costs a contract release, which is why it has not
+	// happened yet. TenantDNSName above is now duplicated the same way.
+
 	tenantDNSServiceLabelKey = "kubezoo.io/tenant-dns"
 	tenantDNSTenantLabelKey  = "kubezoo.io/tenant"
+
+	// tenantDNSPlatformLabelKey marks a pod the platform runs inside a tenant's
+	// namespace, so admission policies written for tenant workloads can exclude
+	// it. See where it is set for why this one cannot be skipped.
+	tenantDNSPlatformLabelKey = "kubezoo.io/platform-workload"
 
 	// tenantDNSSpecHashAnnotation records the spec this controller asked for,
 	// so a change to it reaches tenants that already have a resolver.
@@ -146,9 +164,29 @@ func tenantDNSReaderBinding(tenantID string) string {
 // and the resolver's expired nine months later.
 func tenantDNSUser(tenantID string) string { return tenantID + "-dns" }
 
-// tenantDNSName is the name every per-tenant object gets. The Service being
-// named for its tenant is what makes the gateway's lookup a keyed one.
-func tenantDNSName(tenantID string) string { return tenantID }
+// tenantDNSName is the name every per-tenant object gets. Constant now that the
+// objects live in the tenant's own namespace: the namespace carries the tenant,
+// so the name no longer has to, and a constant is what lets the gateway watch
+// EndpointSlices with a static selector.
+func tenantDNSName(string) string { return TenantDNSName }
+
+// tenantDNSNamespace is the tenant's own kube-system.
+//
+// ⭐ The resolver lives where the tenant can see it because the tenant is billed
+// for it. A pod charged to someone who cannot list it is a line on an invoice
+// with nothing behind it.
+//
+// ⚠️ Two consequences worth being deliberate about rather than surprised by:
+//   - The tenant can read the Secret holding the resolver's credential. That
+//     credential is strictly narrower than the tenant's own -- three resources,
+//     read-only, and usable only through kubezoo -- so reading it gains nothing.
+//     It is still a platform-held private key sitting somewhere the tenant can
+//     read, which is the strongest remaining argument for a ServiceAccount.
+//   - The tenant can delete or edit these objects. The reconciler puts them
+//     back; in between, that tenant's own pods lose DNS. Nobody else's do.
+func tenantDNSNamespace(tenantID string) string {
+	return tenantID + "-kube-system"
+}
 
 // syncTenantDNS provisions the tenant's own resolver, idempotently.
 //
@@ -168,7 +206,7 @@ func (tc *TenantController) syncTenantDNS(tenantID string) error {
 		// Service and keeps writing a nameserver into pods that will not use it.
 		return tc.deleteTenantDNS(tenantID)
 	}
-	if err := tc.ensureTenantDNSNamespace(); err != nil {
+	if err := tc.removeLegacyTenantDNS(tenantID); err != nil {
 		return err
 	}
 	if err := tc.ensureTenantDNSRBAC(tenantID); err != nil {
@@ -329,10 +367,10 @@ func (tc *TenantController) deleteTenantDNS(tenantID string) error {
 			firstErr = err
 		}
 	}
-	record(tc.upstreamAppsClient.Deployments(TenantDNSNamespace).Delete(ctx, name, metav1.DeleteOptions{}))
-	record(tc.upstreamCoreClient.Services(TenantDNSNamespace).Delete(ctx, name, metav1.DeleteOptions{}))
-	record(tc.upstreamCoreClient.ConfigMaps(TenantDNSNamespace).Delete(ctx, name, metav1.DeleteOptions{}))
-	record(tc.upstreamCoreClient.Secrets(TenantDNSNamespace).Delete(ctx, name, metav1.DeleteOptions{}))
+	record(tc.upstreamAppsClient.Deployments(tenantDNSNamespace(tenantID)).Delete(ctx, name, metav1.DeleteOptions{}))
+	record(tc.upstreamCoreClient.Services(tenantDNSNamespace(tenantID)).Delete(ctx, name, metav1.DeleteOptions{}))
+	record(tc.upstreamCoreClient.ConfigMaps(tenantDNSNamespace(tenantID)).Delete(ctx, name, metav1.DeleteOptions{}))
+	record(tc.upstreamCoreClient.Secrets(tenantDNSNamespace(tenantID)).Delete(ctx, name, metav1.DeleteOptions{}))
 
 	// ⚠️ And the tenant's own kubernetes Service, which lives in the TENANT's
 	// namespace rather than the platform one and so was missed the first time.
@@ -360,34 +398,41 @@ func (tc *TenantController) deleteTenantDNS(tenantID string) error {
 	if err := tc.removeTenantDNSNamespaceBindings(ctx, tenantID); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	// ⚠️ And whatever this tenant still has in the platform namespace. Teardown
+	// runs on opt-out too, so a tenant opting out before the reconciler had
+	// migrated it would otherwise keep a resolver nobody looks at any more.
+	if err := tc.removeLegacyTenantDNS(tenantID); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	return firstErr
 }
 
-func (tc *TenantController) ensureTenantDNSNamespace() error {
+// removeLegacyTenantDNS deletes the resolver this tenant used to have in the
+// platform namespace.
+//
+// ⭐ Part of the reconcile path, not a migration script. A reconciler that
+// creates the new shape and leaves the old one running is how a cluster ends up
+// with two resolvers per tenant, one of them serving an address nothing points
+// at any more -- and the tenant is billed for neither, because the leftover is
+// in a namespace it cannot see.
+//
+// Deliberately does not delete the platform namespace itself: it may hold
+// resolvers for tenants this loop has not reached yet, and an empty namespace
+// costs nothing.
+func (tc *TenantController) removeLegacyTenantDNS(tenantID string) error {
 	ctx := context.TODO()
-	_, err := tc.upstreamCoreClient.Namespaces().Get(ctx, TenantDNSNamespace, metav1.GetOptions{})
-	if err == nil {
-		return nil
+	legacy := tenantID
+	var firstErr error
+	record := func(err error) {
+		if err != nil && !apierrors.IsNotFound(err) && firstErr == nil {
+			firstErr = err
+		}
 	}
-	if !apierrors.IsNotFound(err) {
-		return err
-	}
-	_, err = tc.upstreamCoreClient.Namespaces().Create(ctx, &corev1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: TenantDNSNamespace,
-			Labels: map[string]string{
-				"kubezoo.io/managed": "true",
-				// The resolver runs unprivileged and the pod spec is written to
-				// satisfy this, NET_BIND_SERVICE included -- which is the one
-				// capability "restricted" permits to be added.
-				"pod-security.kubernetes.io/enforce": "restricted",
-			},
-		},
-	}, metav1.CreateOptions{})
-	if apierrors.IsAlreadyExists(err) {
-		return nil
-	}
-	return err
+	record(tc.upstreamAppsClient.Deployments(LegacyTenantDNSNamespace).Delete(ctx, legacy, metav1.DeleteOptions{}))
+	record(tc.upstreamCoreClient.Services(LegacyTenantDNSNamespace).Delete(ctx, legacy, metav1.DeleteOptions{}))
+	record(tc.upstreamCoreClient.ConfigMaps(LegacyTenantDNSNamespace).Delete(ctx, legacy, metav1.DeleteOptions{}))
+	record(tc.upstreamCoreClient.Secrets(LegacyTenantDNSNamespace).Delete(ctx, legacy, metav1.DeleteOptions{}))
+	return firstErr
 }
 
 // ensureTenantDNSCredential mints, and later renews, the certificate the
@@ -401,7 +446,7 @@ func (tc *TenantController) ensureTenantDNSNamespace() error {
 func (tc *TenantController) ensureTenantDNSCredential(tenantID string) error {
 	ctx := context.TODO()
 	name := tenantDNSName(tenantID)
-	existing, err := tc.upstreamCoreClient.Secrets(TenantDNSNamespace).Get(ctx, name, metav1.GetOptions{})
+	existing, err := tc.upstreamCoreClient.Secrets(tenantDNSNamespace(tenantID)).Get(ctx, name, metav1.GetOptions{})
 	// ⛔ Recorded as a bool BEFORE anything else can touch err. It was read off
 	// err further down at first, and by then err had been reassigned by the
 	// kubeconfig build below -- so a missing secret took the update branch, which
@@ -430,7 +475,7 @@ func (tc *TenantController) ensureTenantDNSCredential(tenantID string) error {
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
-			Namespace: TenantDNSNamespace,
+			Namespace: tenantDNSNamespace(tenantID),
 			Labels: map[string]string{
 				tenantDNSServiceLabelKey: "true",
 				tenantDNSTenantLabelKey:  tenantID,
@@ -445,14 +490,14 @@ func (tc *TenantController) ensureTenantDNSCredential(tenantID string) error {
 		Data: map[string][]byte{"kubeconfig": kubeconfig},
 	}
 	if missing {
-		_, cerr := tc.upstreamCoreClient.Secrets(TenantDNSNamespace).Create(ctx, secret, metav1.CreateOptions{})
+		_, cerr := tc.upstreamCoreClient.Secrets(tenantDNSNamespace(tenantID)).Create(ctx, secret, metav1.CreateOptions{})
 		if apierrors.IsAlreadyExists(cerr) {
 			return nil
 		}
 		return cerr
 	}
 	secret.ResourceVersion = existing.ResourceVersion
-	_, err = tc.upstreamCoreClient.Secrets(TenantDNSNamespace).Update(ctx, secret, metav1.UpdateOptions{})
+	_, err = tc.upstreamCoreClient.Secrets(tenantDNSNamespace(tenantID)).Update(ctx, secret, metav1.UpdateOptions{})
 	return err
 }
 
@@ -564,7 +609,7 @@ func (tc *TenantController) ensureTenantDNSConfig(tenantID string) error {
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
-			Namespace: TenantDNSNamespace,
+			Namespace: tenantDNSNamespace(tenantID),
 			Labels: map[string]string{
 				tenantDNSServiceLabelKey: "true",
 				tenantDNSTenantLabelKey:  tenantID,
@@ -572,9 +617,9 @@ func (tc *TenantController) ensureTenantDNSConfig(tenantID string) error {
 		},
 		Data: map[string]string{"Corefile": want},
 	}
-	existing, err := tc.upstreamCoreClient.ConfigMaps(TenantDNSNamespace).Get(ctx, name, metav1.GetOptions{})
+	existing, err := tc.upstreamCoreClient.ConfigMaps(tenantDNSNamespace(tenantID)).Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		_, cerr := tc.upstreamCoreClient.ConfigMaps(TenantDNSNamespace).Create(ctx, cm, metav1.CreateOptions{})
+		_, cerr := tc.upstreamCoreClient.ConfigMaps(tenantDNSNamespace(tenantID)).Create(ctx, cm, metav1.CreateOptions{})
 		if apierrors.IsAlreadyExists(cerr) {
 			return nil
 		}
@@ -589,14 +634,14 @@ func (tc *TenantController) ensureTenantDNSConfig(tenantID string) error {
 	// Drift, from a hand edit or from a change to the template. CoreDNS reloads
 	// the file on its own (reload 5s), so no restart is needed.
 	cm.ResourceVersion = existing.ResourceVersion
-	_, err = tc.upstreamCoreClient.ConfigMaps(TenantDNSNamespace).Update(ctx, cm, metav1.UpdateOptions{})
+	_, err = tc.upstreamCoreClient.ConfigMaps(tenantDNSNamespace(tenantID)).Update(ctx, cm, metav1.UpdateOptions{})
 	return err
 }
 
 func (tc *TenantController) ensureTenantDNSService(tenantID string) error {
 	ctx := context.TODO()
 	name := tenantDNSName(tenantID)
-	_, err := tc.upstreamCoreClient.Services(TenantDNSNamespace).Get(ctx, name, metav1.GetOptions{})
+	_, err := tc.upstreamCoreClient.Services(tenantDNSNamespace(tenantID)).Get(ctx, name, metav1.GetOptions{})
 	if err == nil {
 		// ⚠️ Not repaired in place. The ClusterIP is what the gateway has already
 		// written into every pod this tenant is running; rewriting the Service
@@ -607,10 +652,10 @@ func (tc *TenantController) ensureTenantDNSService(tenantID string) error {
 	if !apierrors.IsNotFound(err) {
 		return err
 	}
-	_, err = tc.upstreamCoreClient.Services(TenantDNSNamespace).Create(ctx, &corev1.Service{
+	_, err = tc.upstreamCoreClient.Services(tenantDNSNamespace(tenantID)).Create(ctx, &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
-			Namespace: TenantDNSNamespace,
+			Namespace: tenantDNSNamespace(tenantID),
 			Labels: map[string]string{
 				tenantDNSServiceLabelKey: "true",
 				tenantDNSTenantLabelKey:  tenantID,
@@ -633,7 +678,20 @@ func (tc *TenantController) ensureTenantDNSService(tenantID string) error {
 func (tc *TenantController) ensureTenantDNSDeployment(tenantID string) error {
 	ctx := context.TODO()
 	name := tenantDNSName(tenantID)
-	labels := map[string]string{tenantDNSTenantLabelKey: tenantID, "app": "kubezoo-tenant-dns"}
+	// ⛔ tenantDNSPlatformLabelKey is what keeps the placement policy off this pod,
+	// and it is load-bearing now that the resolver lives in the tenant's own
+	// kube-system. That policy matches every namespace carrying kubezoo.io/tenant
+	// -- which <tid>-kube-system does -- and injects nodeSelector
+	// kubezoo.io/pool=<tid>. On this deployment that pool is a virtual kubelet
+	// that does not implement ClusterIP, so the resolver would be scheduled onto
+	// a node where it cannot serve, and the only symptom would be a resolver that
+	// never becomes ready. The policy in kubezoo-contract excludes this label;
+	// a deployment running some other placement policy has to do the same.
+	labels := map[string]string{
+		tenantDNSTenantLabelKey:   tenantID,
+		tenantDNSPlatformLabelKey: "true",
+		"app":                     "kubezoo-tenant-dns",
+	}
 
 	// ⛔ The credential's fingerprint rides on the POD TEMPLATE, so reissuing it
 	// rolls the pods. CoreDNS builds its client once at startup and never rereads
@@ -642,7 +700,7 @@ func (tc *TenantController) ensureTenantDNSDeployment(tenantID string) error {
 	// restarts it. Without this, credential rotation is a no-op that looks like
 	// it worked right up to the day the old one expires.
 	credHash := ""
-	if sec, err := tc.upstreamCoreClient.Secrets(TenantDNSNamespace).Get(ctx, name, metav1.GetOptions{}); err == nil {
+	if sec, err := tc.upstreamCoreClient.Secrets(tenantDNSNamespace(tenantID)).Get(ctx, name, metav1.GetOptions{}); err == nil {
 		sum := sha256.Sum256(sec.Data["kubeconfig"])
 		credHash = hex.EncodeToString(sum[:8])
 	}
@@ -650,7 +708,7 @@ func (tc *TenantController) ensureTenantDNSDeployment(tenantID string) error {
 	want := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
-			Namespace: TenantDNSNamespace,
+			Namespace: tenantDNSNamespace(tenantID),
 			Labels: map[string]string{
 				tenantDNSServiceLabelKey: "true",
 				tenantDNSTenantLabelKey:  tenantID,
@@ -748,9 +806,9 @@ func (tc *TenantController) ensureTenantDNSDeployment(tenantID string) error {
 	hash := specHash(&want.Spec)
 	want.Annotations = map[string]string{tenantDNSSpecHashAnnotation: hash}
 
-	existing, err := tc.upstreamAppsClient.Deployments(TenantDNSNamespace).Get(ctx, name, metav1.GetOptions{})
+	existing, err := tc.upstreamAppsClient.Deployments(tenantDNSNamespace(tenantID)).Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		_, cerr := tc.upstreamAppsClient.Deployments(TenantDNSNamespace).Create(ctx, want, metav1.CreateOptions{})
+		_, cerr := tc.upstreamAppsClient.Deployments(tenantDNSNamespace(tenantID)).Create(ctx, want, metav1.CreateOptions{})
 		if apierrors.IsAlreadyExists(cerr) {
 			return nil
 		}
@@ -763,7 +821,7 @@ func (tc *TenantController) ensureTenantDNSDeployment(tenantID string) error {
 		return nil
 	}
 	want.ResourceVersion = existing.ResourceVersion
-	_, err = tc.upstreamAppsClient.Deployments(TenantDNSNamespace).Update(ctx, want, metav1.UpdateOptions{})
+	_, err = tc.upstreamAppsClient.Deployments(tenantDNSNamespace(tenantID)).Update(ctx, want, metav1.UpdateOptions{})
 	return err
 }
 

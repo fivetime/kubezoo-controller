@@ -97,7 +97,7 @@ func TestEnsureTenantDNSCredentialCreatesWhenAbsent(t *testing.T) {
 			"a not-found Secret must be CREATED; taking the update branch here is what "+
 			"stopped every tenant from ever getting a resolver", err)
 	}
-	secret, err := client.CoreV1().Secrets(TenantDNSNamespace).Get(context.TODO(), "111111", metav1.GetOptions{})
+	secret, err := client.CoreV1().Secrets(tenantDNSNamespace("111111")).Get(context.TODO(), TenantDNSName, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("the Secret was not created: %v", err)
 	}
@@ -128,11 +128,11 @@ func TestEnsureTenantDNSCredentialIsIdempotent(t *testing.T) {
 	if err := tc.ensureTenantDNSCredential("111111"); err != nil {
 		t.Fatalf("first pass: %v", err)
 	}
-	first, _ := client.CoreV1().Secrets(TenantDNSNamespace).Get(context.TODO(), "111111", metav1.GetOptions{})
+	first, _ := client.CoreV1().Secrets(tenantDNSNamespace("111111")).Get(context.TODO(), TenantDNSName, metav1.GetOptions{})
 	if err := tc.ensureTenantDNSCredential("111111"); err != nil {
 		t.Fatalf("second pass: %v", err)
 	}
-	second, _ := client.CoreV1().Secrets(TenantDNSNamespace).Get(context.TODO(), "111111", metav1.GetOptions{})
+	second, _ := client.CoreV1().Secrets(tenantDNSNamespace("111111")).Get(context.TODO(), TenantDNSName, metav1.GetOptions{})
 	if string(first.Data["kubeconfig"]) != string(second.Data["kubeconfig"]) {
 		t.Error("the credential was reissued on a second pass; reconciliation runs constantly, " +
 			"so this would sign a new certificate every few minutes for every tenant")
@@ -154,17 +154,17 @@ func TestEnsureTenantDNSCredentialRenewsWhenExpiring(t *testing.T) {
 	if err := tc.ensureTenantDNSCredential("111111"); err != nil {
 		t.Fatalf("first pass: %v", err)
 	}
-	stale, _ := client.CoreV1().Secrets(TenantDNSNamespace).Get(context.TODO(), "111111", metav1.GetOptions{})
+	stale, _ := client.CoreV1().Secrets(tenantDNSNamespace("111111")).Get(context.TODO(), TenantDNSName, metav1.GetOptions{})
 	stale.Annotations["kubezoo.io/not-after"] = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
 	stale.Data["kubeconfig"] = []byte("about-to-expire")
-	if _, err := client.CoreV1().Secrets(TenantDNSNamespace).Update(context.TODO(), stale, metav1.UpdateOptions{}); err != nil {
+	if _, err := client.CoreV1().Secrets(tenantDNSNamespace("111111")).Update(context.TODO(), stale, metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("seeding an expiring credential: %v", err)
 	}
 
 	if err := tc.ensureTenantDNSCredential("111111"); err != nil {
 		t.Fatalf("renewal pass: %v", err)
 	}
-	renewed, _ := client.CoreV1().Secrets(TenantDNSNamespace).Get(context.TODO(), "111111", metav1.GetOptions{})
+	renewed, _ := client.CoreV1().Secrets(tenantDNSNamespace("111111")).Get(context.TODO(), TenantDNSName, metav1.GetOptions{})
 	if string(renewed.Data["kubeconfig"]) == "about-to-expire" {
 		t.Error("an expiring credential was left in place; when it lapses the resolver gets 401s " +
 			"from kubezoo and serves an ever-staler cache, with nothing in kubezoo reporting it")
@@ -284,7 +284,7 @@ func TestResolverCredentialIsNotTheTenantAdmin(t *testing.T) {
 	if err := tc.ensureTenantDNSCredential("111111"); err != nil {
 		t.Fatalf("provisioning: %v", err)
 	}
-	secret, _ := client.CoreV1().Secrets(TenantDNSNamespace).Get(context.TODO(), "111111", metav1.GetOptions{})
+	secret, _ := client.CoreV1().Secrets(tenantDNSNamespace("111111")).Get(context.TODO(), TenantDNSName, metav1.GetOptions{})
 
 	var certPEM []byte
 	for _, line := range strings.Split(string(secret.Data["kubeconfig"]), "\n") {
