@@ -20,6 +20,7 @@ import (
 	"context"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -200,5 +201,95 @@ func TestOneTenantsGrantDoesNotNameAnother(t *testing.T) {
 		if b.Subjects[0].Name != want {
 			t.Errorf("binding %q names subject %q, want %q", b.Name, b.Subjects[0].Name, want)
 		}
+	}
+}
+
+// TestResolverDoesNotClaimTheClusterDNSLabel is the regression guard for a
+// label that read as cosmetic and was an instruction to another controller.
+//
+// ⛔ k8s-app=kube-dns is cilium-operator's default --pod-restart-selector
+// (cilium/operator/unmanagedpods/cell.go). It deletes every Running pod
+// carrying it that has no CiliumEndpoint, on a 15s sweep. A resolver on a
+// tenant's own data plane never has one -- it is not on the Cilium data path --
+// so wearing this label had it deleted roughly every 60s, forever.
+//
+// ⚠️ Cilium's own safety valve does not damp it: the 5-minute cooldown is keyed
+// by namespace/name and the ReplicaSet renames every replacement, so the key
+// never matches. Nor is there an Event; that package emits a metric and one log
+// line, which is why this cost five wrong guesses to find.
+//
+// ⭐ The claim is what was wrong, not the mechanism. A pod off Cilium's data
+// path saying "I am the cluster's kube-dns" is a false statement to a
+// controller entitled to act on it. The stock NAMES stay -- Deployment coredns,
+// Service kube-dns -- because those are what a tenant reads and they collide
+// with nothing.
+func TestResolverDoesNotClaimTheClusterDNSLabel(t *testing.T) {
+	if tenantDNSAppLabel == "kube-dns" {
+		t.Fatal("the resolver claims k8s-app=kube-dns again; cilium-operator will " +
+			"delete its pods every ~60s and say so only in its own log")
+	}
+}
+
+// TestSelectorChangeReplacesTheDeployment -- spec.selector is immutable, so a
+// label change cannot be applied by Update at all. Left to the spec-hash path
+// it would be rejected on every pass: retried forever, converged never.
+func TestSelectorChangeReplacesTheDeployment(t *testing.T) {
+	client, tc := rbacFixture("111111")
+	tc.upstreamAppsClient = client.AppsV1()
+	tc.tenantDNSImage = "coredns:test"
+	tc.tenantDNSReplicas = 2
+	tc.tenantDNSClusterDomain = "cluster.local"
+
+	stale := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: TenantDNSName, Namespace: tenantDNSNamespace("111111")},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{
+				tenantDNSTenantLabelKey: "111111", "k8s-app": "kube-dns", // the old claim
+			}},
+			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+				tenantDNSTenantLabelKey: "111111", "k8s-app": "kube-dns",
+			}}},
+		},
+	}
+	if _, err := client.AppsV1().Deployments(tenantDNSNamespace("111111")).
+		Create(context.TODO(), stale, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seeding: %v", err)
+	}
+	client.ClearActions()
+	if err := tc.ensureTenantDNSDeployment("111111"); err != nil {
+		t.Fatalf("reconciling: %v", err)
+	}
+
+	// ⛔ Asserted on the ACTIONS, not on the resulting object. The fake clientset
+	// does not enforce the real API's immutability, so an Update that the real
+	// apiserver rejects outright succeeds here -- and a test that only read the
+	// object back would pass with the replacement branch removed. Measured: it
+	// did. That is the same shape as a reconciler whose guard covers exactly the
+	// subset the code compares, and it is why this looks at what was CALLED.
+	var deleted, created bool
+	for _, a := range client.Actions() {
+		if a.GetResource().Resource != "deployments" {
+			continue
+		}
+		switch a.GetVerb() {
+		case "delete":
+			deleted = true
+		case "create":
+			created = true
+		}
+	}
+	if !deleted || !created {
+		t.Errorf("delete=%v create=%v; want both. spec.selector is immutable, so an "+
+			"Update is rejected by the real apiserver on every pass: retried forever, "+
+			"converged never", deleted, created)
+	}
+
+	got, err := client.AppsV1().Deployments(tenantDNSNamespace("111111")).
+		Get(context.TODO(), TenantDNSName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("the Deployment did not come back: %v", err)
+	}
+	if got.Spec.Selector.MatchLabels["k8s-app"] != tenantDNSAppLabel {
+		t.Errorf("selector k8s-app = %q, want %q", got.Spec.Selector.MatchLabels["k8s-app"], tenantDNSAppLabel)
 	}
 }

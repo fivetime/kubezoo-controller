@@ -97,6 +97,26 @@ const (
 	// ⚠️ Not an exemption from placement -- see where it is set.
 	tenantDNSPlatformLabelKey = "kubezoo.io/platform-workload"
 
+	// tenantDNSAppLabel is what the resolver's pods are selected by.
+	//
+	// ⛔ NOT k8s-app=kube-dns, which is what a stock cluster's CoreDNS carries and
+	// what this used to claim. cilium-operator deletes every Running pod matching
+	// its --pod-restart-selector (default exactly "k8s-app=kube-dns",
+	// cilium/operator/unmanagedpods/cell.go) that has no CiliumEndpoint, on a 15s
+	// sweep. A resolver on a tenant's own data plane never has one -- it is not on
+	// the Cilium data path at all -- so it was deleted roughly every 60s, forever.
+	//
+	// ⚠️ Its own safety valve does not help: the 5-minute per-pod cooldown is keyed
+	// by namespace/name, and the ReplicaSet gives each replacement a new random
+	// suffix, so the key never matches and the loop never damps. Measured:
+	// timeSincePodStarted ~44s, one pod per sweep.
+	//
+	// ⭐ Cilium's assumption is reasonable -- "the cluster's kube-dns must be mine"
+	// -- and the label is the claim. A resolver off its data path has no business
+	// making it. The stock NAMES stay (Deployment coredns, Service kube-dns):
+	// those are what a tenant reads, and they collide with nothing.
+	tenantDNSAppLabel = "kubezoo-dns"
+
 	// tenantDNSSpecHashAnnotation records the spec this controller asked for,
 	// so a change to it reaches tenants that already have a resolver.
 	tenantDNSSpecHashAnnotation = "kubezoo.io/spec-hash"
@@ -683,8 +703,22 @@ func (tc *TenantController) ensureTenantDNSConfig(tenantID string) error {
 func (tc *TenantController) ensureTenantDNSService(tenantID string) error {
 	ctx := context.TODO()
 	name := TenantDNSServiceName
-	_, err := tc.upstreamCoreClient.Services(tenantDNSNamespace(tenantID)).Get(ctx, name, metav1.GetOptions{})
+	existing, err := tc.upstreamCoreClient.Services(tenantDNSNamespace(tenantID)).Get(ctx, name, metav1.GetOptions{})
 	if err == nil {
+		// ⭐ The selector IS reconciled, unlike everything else here. It is
+		// mutable, and leaving it stale after the pod labels change would point
+		// the Service at nothing -- a resolver that exists, holds an address, and
+		// answers no queries. The gateway's readiness gate turns that into a
+		// fallback rather than an outage, but only after the endpoints drain.
+		want := map[string]string{tenantDNSTenantLabelKey: tenantID, "k8s-app": tenantDNSAppLabel}
+		if !equalStringMaps(existing.Spec.Selector, want) {
+			updated := existing.DeepCopy()
+			updated.Spec.Selector = want
+			if _, uerr := tc.upstreamCoreClient.Services(tenantDNSNamespace(tenantID)).
+				Update(ctx, updated, metav1.UpdateOptions{}); uerr != nil {
+				return fmt.Errorf("reconciling the resolver Service selector for %s: %w", tenantID, uerr)
+			}
+		}
 		// ⚠️ Not repaired in place. The ClusterIP is what the gateway has already
 		// written into every pod this tenant is running; rewriting the Service
 		// could reallocate it and leave those pods pointed at nothing, and a pod
@@ -714,7 +748,7 @@ func (tc *TenantController) ensureTenantDNSService(tenantID string) error {
 			},
 		},
 		Spec: corev1.ServiceSpec{
-			Selector: map[string]string{tenantDNSTenantLabelKey: tenantID, "k8s-app": "kube-dns"},
+			Selector: map[string]string{tenantDNSTenantLabelKey: tenantID, "k8s-app": tenantDNSAppLabel},
 			Ports: []corev1.ServicePort{
 				{Name: "dns-udp", Port: 53, TargetPort: intstr.FromInt32(tenantDNSPort), Protocol: corev1.ProtocolUDP},
 				{Name: "dns-tcp", Port: 53, TargetPort: intstr.FromInt32(tenantDNSPort), Protocol: corev1.ProtocolTCP},
@@ -753,7 +787,7 @@ func (tc *TenantController) ensureTenantDNSDeployment(tenantID string) error {
 		// ⭐ The label a stock cluster's CoreDNS carries, for the same reason the
 		// names match it: what the tenant sees in its own kube-system should be
 		// what it would see in any cluster.
-		"k8s-app": "kube-dns",
+		"k8s-app": tenantDNSAppLabel,
 	}
 
 	// ⛔ The credential's fingerprint rides on the POD TEMPLATE, so reissuing it
@@ -880,12 +914,54 @@ func (tc *TenantController) ensureTenantDNSDeployment(tenantID string) error {
 	if err != nil {
 		return err
 	}
+	// ⛔ Checked BEFORE the hash, because a selector change cannot be applied by
+	// the path below at all: spec.selector is immutable, so Update is rejected
+	// outright. Left to the hash check this would retry forever and converge
+	// never -- loud in the log and invisible everywhere else.
+	//
+	// ⚠️ Delete-and-recreate means the tenant's resolver is briefly absent, so
+	// its pods fall back to the platform resolver for a few seconds (the gateway
+	// refuses a resolver with no ready endpoint). That is the correct trade
+	// against never converging, but it is a real gap, not a free operation.
+	if !equalStringMaps(selectorOf(existing), selectorOf(want)) {
+		klog.InfoS("tenant resolver selector changed; replacing the Deployment",
+			"tenant", tenantID, "from", selectorOf(existing), "to", selectorOf(want))
+		if err := tc.upstreamAppsClient.Deployments(tenantDNSNamespace(tenantID)).
+			Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("replacing the resolver Deployment for %s: %w", tenantID, err)
+		}
+		_, cerr := tc.upstreamAppsClient.Deployments(tenantDNSNamespace(tenantID)).Create(ctx, want, metav1.CreateOptions{})
+		if apierrors.IsAlreadyExists(cerr) {
+			// The old one is still terminating. The next pass finds it gone.
+			return nil
+		}
+		return cerr
+	}
 	if existing.Annotations[tenantDNSSpecHashAnnotation] == hash {
 		return nil
 	}
 	want.ResourceVersion = existing.ResourceVersion
 	_, err = tc.upstreamAppsClient.Deployments(tenantDNSNamespace(tenantID)).Update(ctx, want, metav1.UpdateOptions{})
 	return err
+}
+
+func selectorOf(d *appsv1.Deployment) map[string]string {
+	if d == nil || d.Spec.Selector == nil {
+		return nil
+	}
+	return d.Spec.Selector.MatchLabels
+}
+
+func equalStringMaps(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 // specHash summarises the spec this controller asked for.
