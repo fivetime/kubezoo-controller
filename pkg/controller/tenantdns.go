@@ -143,12 +143,12 @@ const (
 	// nothing on that node ever reads: the object would claim a resolver the pod
 	// does not use, and no component anywhere would report the disagreement.
 	//
-	// ⚠️ The example this was written for -- an OpenStack Zun capsule -- is no
-	// longer one. The knaas provider composes a capsule's search list itself, and
-	// reading spec.dnsConfig instead makes the injected values the ones that take
-	// effect; the resolver's ClusterIP is reachable there because that Service's
-	// Octavia VIP *is* its ClusterIP. Where the annotation still applies is a data
-	// plane that reads neither.
+	// ⚠️ Whether an OpenStack Zun capsule is such a data plane is being settled:
+	// the knaas provider composes a capsule's search list itself, so reading
+	// spec.dnsConfig instead would make the injected values the ones that take
+	// effect. The nameserver in there has to be an address the capsule can
+	// actually reach, which the upstream cluster's ClusterIP is not -- that is a
+	// separate translation at the kubezoo boundary, not settled here.
 	TenantDNSOptOutAnnotation = "kubezoo.io/tenant-dns"
 	tenantDNSOptOutValue      = "disabled"
 
