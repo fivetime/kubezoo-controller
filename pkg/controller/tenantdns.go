@@ -143,12 +143,24 @@ const (
 	// nothing on that node ever reads: the object would claim a resolver the pod
 	// does not use, and no component anywhere would report the disagreement.
 	//
-	// ⚠️ Whether an OpenStack Zun capsule is such a data plane is being settled:
-	// the knaas provider composes a capsule's search list itself, so reading
-	// spec.dnsConfig instead would make the injected values the ones that take
-	// effect. The nameserver in there has to be an address the capsule can
-	// actually reach, which the upstream cluster's ClusterIP is not -- that is a
-	// separate translation at the kubezoo boundary, not settled here.
+	// ⛔ DO NOT set this on a tenant whose pods are Zun capsules. This comment
+	// used to name exactly that case as the reason the annotation exists, on two
+	// grounds that are both now false:
+	//
+	//   - "a capsule's DNS comes from Designate". Designate was dropped. A single
+	//     global DNS namespace cannot resolve every tenant's
+	//     rsvc.default.svc.cluster.local to that tenant's own address -- not a
+	//     matter of effort, it is what one namespace means.
+	//   - "a capsule discards dnsConfig". It no longer does. The provider grew an
+	//     annotation channel for it, and a capsule's search list and nameserver
+	//     were measured to match what the gateway injects.
+	//
+	// So a capsule-backed tenant is now the case that NEEDS its own resolver
+	// rather than the case that cannot use one. Nothing here changes behaviour --
+	// the annotation is explicit and never inferred from where a tenant runs --
+	// but the reasoning above was the reasoning someone would have applied.
+	//
+	// What still fits: a data plane that reads neither dnsPolicy nor dnsConfig.
 	TenantDNSOptOutAnnotation = "kubezoo.io/tenant-dns"
 	tenantDNSOptOutValue      = "disabled"
 
